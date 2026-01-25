@@ -638,6 +638,31 @@ while true; do
       
       echo ""
       echo "✅ SUCCÈS : Utilisateur $STANDARD_USER créé et ajouté aux administrateurs."
+      
+      # --- NOUVELLE FONCTIONNALITÉ : COLORATION SYNTAXIQUE USER ---
+      # Propose d'activer la coloration dans le .bashrc de l'utilisateur
+      echo ""
+      read -p "Voulez-vous activer la coloration syntaxique pour $STANDARD_USER ? (y/n) : " COLOR_USER_CHOICE
+      
+      if [[ "$COLOR_USER_CHOICE" == "y" ]]; then
+        USER_BASHRC="/home/$STANDARD_USER/.bashrc"
+        if [ -f "$USER_BASHRC" ]; then
+          echo "→ Activation de la coloration dans $USER_BASHRC..."
+          
+          # Décommenter force_color_prompt=yes pour avoir le prompt couleur
+          sed -i 's/^#force_color_prompt=yes/force_color_prompt=yes/' "$USER_BASHRC"
+          
+          # Décommenter les alias ls/grep s'ils sont présents (standard Debian)
+          sed -i 's/^#alias ls/alias ls/' "$USER_BASHRC"
+          sed -i 's/^#alias grep/alias grep/' "$USER_BASHRC"
+          
+          echo "✓ Prompt et alias colorés activés pour $STANDARD_USER"
+        else
+          echo "⚠ Fichier .bashrc non trouvé, impossible d'activer la coloration."
+        fi
+      fi
+      # -----------------------------------------------------------
+
       # IMPORTANT : On sort de la boucle car tout est fini
       break
   else
@@ -658,8 +683,9 @@ echo "Fin de l'étape utilisateur."
 # ÉTAPE 7 : SÉCURISATION SSH
 ################################################################################
 # Sécurisation du service SSH (Secure Shell) :
+# - Vérification et installation si nécessaire
 # - Changement du port par défaut (22) pour éviter les scans automatiques
-# - Désactivation de la connexion root directe (si un user sudo existe)
+# - Désactivation (ou configuration) de la connexion root
 ################################################################################
 
 echo ""
@@ -669,63 +695,119 @@ echo "=========================================="
 echo ""
 echo "Configuration du service SSH pour l'accès à distance."
 echo ""
-echo "POURQUOI SÉCURISER SSH ?"
-echo "  - Le port 22 est scanné en permanence par des bots"
-echo "  - L'utilisateur 'root' est la cible n°1 des attaques"
-echo ""
-echo "CHANGEMENTS PROPOSÉS :"
-echo "  1. Changer le port d'écoute (ex: 2222, 54321...)"
-echo "  2. Interdire la connexion directe en root"
-echo ""
-read -p "Entrez le nouveau port SSH (par défaut 22, recommandé : 1024-65535) : " SSH_PORT
 
-# Valeur par défaut si vide
-if [[ -z "$SSH_PORT" ]]; then
-  SSH_PORT=22
+# 1. Vérification de l'installation de SSH
+echo "→ Vérification de l'installation du service SSH..."
+SKIP_SSH_CONFIG="false"
+
+if dpkg -s openssh-server &> /dev/null; then
+    echo "✅ Le service SSH (openssh-server) est DÉJÀ INSTALLÉ."
+    echo "   Vous pouvez vous connecter via : ssh utilisateur@$(ip -4 addr show $INTERFACE | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)"
+else
+    echo "❌ Le service SSH n'est PAS installé."
+    echo "   Sans SSH, vous ne pourrez pas gérer ce serveur à distance."
+    echo ""
+    read -p "Voulez-vous installer le serveur SSH maintenant ? (y/n) : " INSTALL_SSH
+
+    if [[ "$INSTALL_SSH" == "y" ]]; then
+        echo "Installation de openssh-server..."
+        apt-get update && apt-get install -y openssh-server
+        check_command
+        echo "✓ SSH installé avec succès."
+    else
+        echo "⚠ Installation ignorée."
+        echo "   La configuration SSH sera passée."
+        SKIP_SSH_CONFIG="true"
+    fi
 fi
 
-# Validation du port (doit être un nombre entre 1 et 65535)
-if [[ "$SSH_PORT" =~ ^[0-9]+$ && $SSH_PORT -ge 1 && $SSH_PORT -le 65535 ]]; then
-  
-  # Vérifier si le fichier sshd_config existe
-  if [ ! -f /etc/ssh/sshd_config ]; then
+# Si SSH est installé ou vient de l'être, on continue la configuration
+if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
     echo ""
-    echo "→ Installation de openssh-server..."
-    apt install -y openssh-server
-    check_command
-  fi
-  
-  echo ""
-  echo "→ Configuration du port SSH sur $SSH_PORT..."
-  # Modifier le port SSH dans la config
-  sed -i "s/^#\?Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
-  
-  # Désactiver l'accès root SSH seulement si un utilisateur standard a été créé
-  if [[ -n "$STANDARD_USER" ]]; then
-    echo "→ Désactivation de l'accès SSH pour root..."
-    sed -i "s/^#\?PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
-  else
-    echo "⚠ AVERTISSEMENT : Accès root SSH maintenu (aucun utilisateur standard créé)."
-  fi
-  
-  echo "→ Redémarrage du service SSH..."
-  systemctl restart ssh
-  check_command
-  
-  echo ""
-  echo "✓ CONFIGURATION SSH APPLIQUÉE"
-  
-  if [[ "$SSH_PORT" != "22" ]]; then
+    echo "POURQUOI SÉCURISER SSH ?"
+    echo "  - Le port 22 est scanné en permanence par des bots"
+    echo "  - L'utilisateur 'root' est la cible n°1 des attaques"
     echo ""
-    echo "!!! IMPORTANT !!!"
-    echo "Le port SSH a été changé pour $SSH_PORT"
-    echo "Pour vous reconnecter, utilisez : ssh -p $SSH_PORT user@server"
+    echo "CHANGEMENTS PROPOSÉS :"
+    echo "  1. Changer le port d'écoute (ex: 2222, 54321...)"
+    echo "  2. Configurer la connexion root (Désactivée ou Autorisée)"
     echo ""
-  fi
+    read -p "Entrez le nouveau port SSH (par défaut 22, recommandé : 1024-65535) : " SSH_PORT
+
+    # Valeur par défaut si vide
+    if [[ -z "$SSH_PORT" ]]; then
+      SSH_PORT=22
+    fi
+
+    # Validation du port (doit être un nombre entre 1 et 65535)
+    if [[ "$SSH_PORT" =~ ^[0-9]+$ && $SSH_PORT -ge 1 && $SSH_PORT -le 65535 ]]; then
+      
+      echo ""
+      echo "→ Configuration du port SSH sur $SSH_PORT..."
+      # Modifier le port SSH dans la config
+      sed -i "s/^#\?Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
+      
+      # Menu pour la gestion du login ROOT
+      echo ""
+      echo "--- CONFIGURATION DE L'ACCÈS ROOT (root login) ---"
+      echo "1. DÉSACTIVER la connexion root (Recommandé pour la sécurité)"
+      echo "2. AUTORISER la connexion root (⚠ DANGEREUX ⚠ - Lab uniquement)"
+      echo "3. Ne rien modifier (Garder la config actuelle)"
+      echo ""
+      read -p "Votre choix (1/2/3) : " ROOT_LOGIN_CHOICE
+
+      case $ROOT_LOGIN_CHOICE in
+        1)
+            # Désactiver root
+            sed -i "s/^#\?PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
+            echo "✓ Accès root SSH : DÉSACTIVÉ."
+            ;;
+        2)
+            # Activer root avec avertissement
+            echo ""
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            echo "⚠ ATTENTION : VOUS AVEZ CHOISI D'AUTORISER LE LOGIN ROOT ⚠"
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            echo "Cette configuration est TRÈS DANGEREUSE."
+            echo "Elle ne doit être utilisée QUE dans un contexte de LABORATOIRE"
+            echo "sur un serveur NON EXPOSÉ sur Internet."
+            echo "Les robots scannent et attaquent le compte root en permanence."
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            echo ""
+            read -p "Confirmez-vous ce choix dangereux ? (y/n) : " CONFIRM_DANGER
+            if [[ "$CONFIRM_DANGER" == "y" ]]; then
+                sed -i "s/^#\?PermitRootLogin .*/PermitRootLogin yes/" /etc/ssh/sshd_config
+                echo "⚠ Accès root SSH : AUTORISÉ (Soyez prudent)."
+            else
+                echo "→ Annulé. Aucune modification sur l'accès root."
+            fi
+            ;;
+        *)
+            echo "→ Aucune modification sur l'accès root."
+            ;;
+      esac
+      
+      echo "→ Redémarrage du service SSH..."
+      systemctl restart ssh
+      check_command
+      
+      echo ""
+      echo "✓ CONFIGURATION SSH APPLIQUÉE"
+      
+      if [[ "$SSH_PORT" != "22" ]]; then
+        echo ""
+        echo "!!! IMPORTANT !!!"
+        echo "Le port SSH a été changé pour $SSH_PORT"
+        echo "Pour vous reconnecter, utilisez : ssh -p $SSH_PORT user@server"
+        echo ""
+      fi
+    else
+      echo ""
+      echo "❌ ERREUR : Port SSH invalide. Configuration SSH ignorée."
+      echo ""
+    fi
 else
-  echo ""
-  echo "❌ ERREUR : Port SSH invalide. Configuration SSH ignorée."
-  echo ""
+    echo "→ Configuration SSH sautée."
 fi
 
 ################################################################################
@@ -753,12 +835,18 @@ if [[ -n "$STANDARD_USER" ]]; then
   echo "  ✓ Utilisateur créé : $STANDARD_USER (avec sudo)"
 fi
 
-echo "  ✓ Port SSH : $SSH_PORT"
-
-if [[ -n "$STANDARD_USER" ]]; then
-  echo "  ✓ Accès root SSH : DÉSACTIVÉ (Sécurisé)"
+if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
+    echo "  ✓ Port SSH : $SSH_PORT"
+    # Vérification simple pour le récapitulatif
+    if grep -q "^PermitRootLogin no" /etc/ssh/sshd_config; then
+        echo "  ✓ Accès root SSH : DÉSACTIVÉ (Sécurisé)"
+    elif grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config; then
+        echo "  ⚠ Accès root SSH : AUTORISÉ (DANGEREUX)"
+    else
+        echo "  - Accès root SSH : Non modifié"
+    fi
 else
-  echo "  ⚠ Accès root SSH : ACTIVÉ (Risque de sécurité)"
+    echo "  - SSH : Non installé ou non configuré"
 fi
 
 echo ""
@@ -771,7 +859,7 @@ if [[ "$CONFIGURE_IP" == "y" ]]; then
   echo "1. Vérifier l'IP : ip addr show $INTERFACE"
   echo "   (Vous devriez voir $STATIC_IP)"
 fi
-echo "2. Vérifier SSH  : sudo ss -tnlp | grep ssh"
+echo "2. Vérifier SSH  : ss -tnlp | grep ssh"
 echo "   (Vous devriez voir le port $SSH_PORT)"
 if [[ -n "$STANDARD_USER" ]]; then
   echo "3. Tester l'accès : ssh -p $SSH_PORT $STANDARD_USER@<IP>"
@@ -800,7 +888,7 @@ else
   echo "N'oubliez pas de redémarrer manuellement avec la commande 'reboot'"
   echo "pour appliquer tous les changements système. Sinon vous pouvez redémarrer"
   echo "uniquement le service réseau avec 'sudo systemctl restart systemd-networkd'"
-  echo "pour appliquer votre changement d'IP (si vous êtes connecté en SSH "
+  echo "pour appliquer votre changement d'IP (⚠ si vous êtes connecté en SSH "
   echo "le terminal va se figer et vous devrez vous reconnecter sur la nouvelle IP)"
   echo ""
 fi
