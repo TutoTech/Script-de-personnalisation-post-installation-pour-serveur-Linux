@@ -1,5 +1,5 @@
 # Script-de-personnalisation-post-installation-pour-serveur-Linux
-Script de configuration automatisée pour serveur Debian 13
+Script Bash d'automatisation post-installation pour serveur Debian 13 (Trixie). Configure rapidement les essentiels : clavier FR, IP fixe (systemd-networkd), coloration syntaxique, création d'utilisateur sudo et sécurisation SSH. Idéal pour transformer une installation minimale en environnement prêt à l'emploi.
 
 ---
 
