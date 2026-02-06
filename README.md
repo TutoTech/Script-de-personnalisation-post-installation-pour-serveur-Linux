@@ -29,7 +29,12 @@ Le script traite les sept étapes essentielles de la mise en service d'un serveu
 
 ### 🚀 Utilisation
 
-Pour lancer la configuration, exécutez simplement la commande suivante :
+Pour lancer la configuration, exécutez simplement la commande suivante directement dans le terminal de votre Debian (accès à Internet requis) :
+
+```bash
+sudo -E bash -c 'f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f" && rm -f "$f"'
+```
+ou plus classiquement : 
 
 ```bash
 chmod +x script-de-personnalisation-post-installation-pour-debian-13.sh
@@ -66,6 +71,12 @@ The script automates seven critical setup steps:
 ### 🚀 Usage
 
 To start the configuration, simply run:
+
+```bash
+sudo -E bash -c 'f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f" && rm -f "$f"'
+```
+
+or : 
 
 ```bash
 chmod +x script-de-personnalisation-post-installation-pour-debian-13.sh
