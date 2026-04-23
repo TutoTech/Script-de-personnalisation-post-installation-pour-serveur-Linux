@@ -34,13 +34,6 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-# Détecte si le script est exécuté depuis une session SSH pour éviter toute
-# bascule réseau immédiate qui couperait la connexion avant la fin du script.
-RUNNING_OVER_SSH="false"
-if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_CLIENT:-}" || -n "${SSH_TTY:-}" ]]; then
-  RUNNING_OVER_SSH="true"
-fi
-
 ################################################################################
 # FONCTION : Vérification des erreurs de commande
 ################################################################################
@@ -536,10 +529,7 @@ EOF
     echo "→ Configuration enregistrée pour $INTERFACE."
     echo "⚠  La nouvelle configuration IP sera appliquée au prochain redémarrage."
     echo "   (Cela évite de couper votre connexion SSH actuelle)"
-    if [[ "$RUNNING_OVER_SSH" == "true" ]]; then
-      echo "   Session SSH détectée : aucun redémarrage réseau immédiat n'a été effectué."
-    fi
-     
+    
     echo ""
     echo "✓ CONFIGURATION RÉSEAU ENREGISTRÉE"
     echo ""
