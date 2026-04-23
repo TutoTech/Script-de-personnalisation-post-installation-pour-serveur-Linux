@@ -490,6 +490,7 @@ if [[ "$CONFIGURE_IP" == "y" ]]; then
         cp /etc/network/interfaces "$BACKUP_INTERFACES"
         check_command
         echo "  (le fichier courant est conservé jusqu'au redémarrage)"
+        echo "  (au prochain démarrage, le service 'networking' étant désactivé, il ne sera plus utilisé)"
       fi
     fi
      
