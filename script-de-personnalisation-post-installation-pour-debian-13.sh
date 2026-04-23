@@ -34,6 +34,13 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# Détecte si le script est exécuté depuis une session SSH pour éviter toute
+# bascule réseau immédiate qui couperait la connexion avant la fin du script.
+RUNNING_OVER_SSH="false"
+if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_CLIENT:-}" || -n "${SSH_TTY:-}" ]]; then
+  RUNNING_OVER_SSH="true"
+fi
+
 ################################################################################
 # FONCTION : Vérification des erreurs de commande
 ################################################################################
@@ -467,16 +474,23 @@ if [[ "$CONFIGURE_IP" == "y" ]]; then
     echo "Il remplace l'ancien système ifupdown."
     echo ""
      
-    # Désactiver le service networking s'il est actif (ancien système ifupdown)
-    if systemctl is-active --quiet networking; then
-      echo "→ Désactivation de l'ancien service 'networking' (ifupdown)..."
-      systemctl disable --now networking
-       
-      # Sauvegarde de l'ancien fichier de configuration
+    # Préparer le basculement vers systemd-networkd sans interrompre la session
+    # courante. L'arrêt immédiat de "networking" coupe la connexion SSH.
+    if systemctl list-unit-files networking.service >/dev/null 2>&1; then
+      if systemctl is-enabled --quiet networking || systemctl is-active --quiet networking; then
+        echo "→ Le service 'networking' sera désactivé au prochain démarrage."
+        echo "  (aucun arrêt immédiat pour préserver la connexion en cours)"
+        systemctl disable networking
+        check_command
+      fi
+
+      # Sauvegarde non destructive de l'ancienne configuration ifupdown.
       if [ -f /etc/network/interfaces ]; then
-        echo "→ Sauvegarde de /etc/network/interfaces..."
-        mv /etc/network/interfaces /etc/network/interfaces.backup.$(date +%Y%m%d-%H%M%S)
-        echo "  (sauvegardé avec horodatage)"
+        BACKUP_INTERFACES="/etc/network/interfaces.backup.$(date +%Y%m%d-%H%M%S)"
+        echo "→ Sauvegarde de /etc/network/interfaces vers $BACKUP_INTERFACES..."
+        cp /etc/network/interfaces "$BACKUP_INTERFACES"
+        check_command
+        echo "  (le fichier courant est conservé jusqu'au redémarrage)"
       fi
     fi
      
@@ -522,6 +536,9 @@ EOF
     echo "→ Configuration enregistrée pour $INTERFACE."
     echo "⚠  La nouvelle configuration IP sera appliquée au prochain redémarrage."
     echo "   (Cela évite de couper votre connexion SSH actuelle)"
+    if [[ "$RUNNING_OVER_SSH" == "true" ]]; then
+      echo "   Session SSH détectée : aucun redémarrage réseau immédiat n'a été effectué."
+    fi
      
     echo ""
     echo "✓ CONFIGURATION RÉSEAU ENREGISTRÉE"

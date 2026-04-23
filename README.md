@@ -24,7 +24,7 @@ Le script traite les sept étapes essentielles de la mise en service d'un serveu
 ### 📋 Prérequis
 
 * Un serveur tournant sous **Debian 13**.
-* Un accès direct à la console (physique ou via IPMI/VNC) est recommandé, notamment pour la configuration réseau.
+* Un accès direct à la console (physique ou via IPMI/VNC) reste recommandé, mais la configuration d'une IP fixe via SSH est maintenant enregistrée pour le prochain redémarrage afin de laisser le script se terminer sans couper la session en cours.
 * Les privilèges **root** ou **sudo**.
 
 ### 🚀 Utilisation
@@ -65,7 +65,7 @@ The script automates seven critical setup steps:
 ### 📋 Prerequisites
 
 * A server running **Debian 13**.
-* Direct console access (physical or VNC/IPMI) is recommended, especially when modifying network settings.
+* Direct console access (physical or VNC/IPMI) is still recommended, but static IP changes made over SSH are now saved for the next reboot so the script can finish without dropping the current session.
 * **Root** or **sudo** privileges.
 
 ### 🚀 Usage
