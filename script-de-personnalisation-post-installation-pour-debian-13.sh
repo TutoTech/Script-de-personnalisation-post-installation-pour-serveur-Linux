@@ -529,7 +529,7 @@ EOF
     echo "→ Configuration enregistrée pour $INTERFACE."
     echo "⚠  La nouvelle configuration IP sera appliquée au prochain redémarrage."
     echo "   (Cela évite de couper votre connexion SSH actuelle)"
-    
+
     echo ""
     echo "✓ CONFIGURATION RÉSEAU ENREGISTRÉE"
     echo ""
