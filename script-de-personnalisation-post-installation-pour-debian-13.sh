@@ -476,7 +476,7 @@ if [[ "$CONFIGURE_IP" == "y" ]]; then
      
     # Préparer le basculement vers systemd-networkd sans interrompre la session
     # courante. L'arrêt immédiat de "networking" coupe la connexion SSH.
-    if systemctl list-unit-files networking.service >/dev/null 2>&1; then
+    if systemctl cat networking.service >/dev/null 2>&1; then
       if systemctl is-enabled --quiet networking || systemctl is-active --quiet networking; then
         echo "→ Le service 'networking' sera désactivé au prochain démarrage."
         echo "  (aucun arrêt immédiat pour préserver la connexion en cours)"
