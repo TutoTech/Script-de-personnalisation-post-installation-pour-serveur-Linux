@@ -476,13 +476,12 @@ if [[ "$CONFIGURE_IP" == "y" ]]; then
      
     # Préparer le basculement vers systemd-networkd sans interrompre la session
     # courante. L'arrêt immédiat de "networking" coupe la connexion SSH.
-    if systemctl cat networking.service >/dev/null 2>&1; then
-      if systemctl is-enabled --quiet networking || systemctl is-active --quiet networking; then
-        echo "→ Le service 'networking' sera désactivé au prochain démarrage."
-        echo "  (aucun arrêt immédiat pour préserver la connexion en cours)"
-        systemctl disable networking
-        check_command
-      fi
+    NETWORKING_LOAD_STATE="$(systemctl show -p LoadState --value networking.service 2>/dev/null)"
+    if [[ -n "$NETWORKING_LOAD_STATE" && "$NETWORKING_LOAD_STATE" != "not-found" ]]; then
+      echo "→ Le service 'networking' sera désactivé au prochain démarrage."
+      echo "  (aucun arrêt immédiat pour préserver la connexion en cours)"
+      systemctl disable networking
+      check_command
 
       # Sauvegarde non destructive de l'ancienne configuration ifupdown.
       if [ -f /etc/network/interfaces ]; then
