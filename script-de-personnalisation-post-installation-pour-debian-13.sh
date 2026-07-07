@@ -467,8 +467,11 @@ if [[ "$CONFIGURE_IP" == "y" ]]; then
     echo "Il remplace l'ancien système ifupdown."
     echo ""
      
-    # Désactiver le service networking s'il est actif (ancien système ifupdown)
-    if systemctl is-active --quiet networking; then
+    # Désactiver le service networking s'il est actif OU juste activé au boot
+    # (ancien système ifupdown). On vérifie is-enabled en plus de is-active
+    # car un service inactif mais toujours enabled démarrerait quand même au
+    # prochain reboot et entrerait en conflit avec systemd-networkd.
+    if systemctl is-active --quiet networking || systemctl is-enabled --quiet networking; then
       echo "→ Désactivation au démarrage de l'ancien service 'networking' (ifupdown)..."
       echo "  (arrêt différé au prochain redémarrage pour ne pas couper la connexion SSH actuelle)"
       # IMPORTANT : ne PAS utiliser --now ici. Ce service est probablement celui qui
@@ -477,6 +480,7 @@ if [[ "$CONFIGURE_IP" == "y" ]]; then
       # connexion SSH en plein script (avant même que systemd-networkd ne soit
       # configuré), laissant le serveur sans réseau jusqu'au prochain accès console.
       systemctl disable networking
+      check_command
 
       # Sauvegarde de l'ancien fichier de configuration
       if [ -f /etc/network/interfaces ]; then
