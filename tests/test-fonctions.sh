@@ -167,6 +167,28 @@ egal "le contenu n'est pas dupliqué"               "1" "$(grep -c '^contenu du 
 egal "la ligne préexistante est conservée"         "1" "$(grep -c '^ligne existante$' "$TMP_RC")"
 rm -f "$TMP_RC"
 
+# Non-régression : un marqueur de fin supprimé à la main ne doit JAMAIS faire
+# disparaître la suite du fichier. Un découpage « à l'état » tronquait tout ce
+# qui suivait le marqueur de début.
+TMP_RC="$(mktemp)"
+printf 'avant\n# >>> debut >>>\nancien bloc\nAPRES-A-CONSERVER\nfin de fichier\n' > "$TMP_RC"
+write_marked_block "$TMP_RC" "# >>> debut >>>" "# <<< fin <<<" 2>/dev/null <<'BLOC'
+nouveau contenu
+BLOC
+egal "marqueur de fin absent : ligne suivante conservée" "1" "$(grep -c '^APRES-A-CONSERVER$' "$TMP_RC")"
+egal "marqueur de fin absent : fin de fichier conservée" "1" "$(grep -c '^fin de fichier$' "$TMP_RC")"
+egal "marqueur de fin absent : nouveau bloc ajouté"      "1" "$(grep -c '^nouveau contenu$' "$TMP_RC")"
+rm -f "$TMP_RC"
+
+# Cas inverse : marqueurs présents mais dans le désordre — on ne touche à rien.
+TMP_RC="$(mktemp)"
+printf '# <<< fin <<<\nA-CONSERVER\n# >>> debut >>>\n' > "$TMP_RC"
+write_marked_block "$TMP_RC" "# >>> debut >>>" "# <<< fin <<<" 2>/dev/null <<'BLOC'
+nouveau contenu
+BLOC
+egal "marqueurs inversés : contenu conservé"             "1" "$(grep -c '^A-CONSERVER$' "$TMP_RC")"
+rm -f "$TMP_RC"
+
 echo "== set_sshd_directive =="
 TMP_SSHD="$(mktemp)"
 printf '#Port 22\nPermitRootLogin prohibit-password\n' > "$TMP_SSHD"

@@ -360,23 +360,33 @@ restore_file() {
 # au lieu de l'empiler. L'ancienne version testait la présence du bloc avec un
 # motif grep qui ne correspondait jamais au texte réellement écrit : chaque
 # exécution du script dupliquait la configuration du prompt dans /root/.bashrc.
+#
+# Le retrait de l'ancien bloc se fait par NUMÉROS DE LIGNE, et uniquement si les
+# DEUX marqueurs sont présents et dans le bon ordre. Un découpage « à l'état »
+# (on ignore tout après le marqueur de début jusqu'au marqueur de fin) tronquerait
+# tout le reste du fichier si l'utilisateur avait supprimé le marqueur de fin en
+# éditant son .bashrc à la main. Dans ce cas on préfère ne rien retirer et
+# prévenir : mieux vaut un bloc en double qu'un fichier amputé.
 ################################################################################
 write_marked_block() {
   local file="${1:-}" begin="${2:-}" end="${3:-}"
-  local content tmp
+  local content tmp n_begin n_end
 
   content="$(cat)"
   [[ -n "$file" ]] || return 1
   [[ -e "$file" ]] || touch "$file"
 
-  if grep -qF -- "$begin" "$file" 2>/dev/null; then
+  n_begin="$(grep -nF -m1 -- "$begin" "$file" 2>/dev/null | cut -d: -f1)"
+  n_end="$(grep -nF -m1 -- "$end" "$file" 2>/dev/null | cut -d: -f1)"
+
+  if [[ -n "$n_begin" && -n "$n_end" ]] && (( n_end > n_begin )); then
     tmp="$(mktemp)"
-    awk -v b="$begin" -v e="$end" '
-      index($0, b) { skip = 1 }
-      !skip        { print }
-      index($0, e) { skip = 0 }
-    ' "$file" > "$tmp" && cat "$tmp" > "$file"
+    awk -v s="$n_begin" -v e="$n_end" 'NR < s || NR > e' "$file" > "$tmp" && cat "$tmp" > "$file"
     rm -f "$tmp"
+  elif [[ -n "$n_begin" || -n "$n_end" ]]; then
+    log_warn "Bloc géré incomplet dans $file (marqueur de début ou de fin manquant)."
+    echo "  Par sécurité, rien n'est supprimé : un nouveau bloc est ajouté à la suite." >&2
+    echo "  Vous pouvez retirer l'ancien à la main si nécessaire." >&2
   fi
 
   {
@@ -1422,9 +1432,18 @@ appliquer_pile() {
     ifupdown)
       systemctl enable networking >/dev/null 2>&1
       ifdown --force "$NET_IFACE" >/dev/null 2>&1
-      # Un client DHCP encore actif reprendrait la main sur l'interface.
+      # Un client DHCP encore actif reprendrait la main sur l'interface. Sur
+      # Debian 13 c'est dhcpcd (isc-dhcp-client/dhclient a été abandonné en
+      # amont), mais une machine mise à niveau depuis Bookworm peut encore
+      # utiliser dhclient : on relâche proprement le bail avec l'outil présent,
+      # sans supposer qu'un binaire donné existe.
+      if command -v dhcpcd >/dev/null 2>&1; then
+        dhcpcd -k "$NET_IFACE" >/dev/null 2>&1
+      fi
+      if command -v dhclient >/dev/null 2>&1; then
+        dhclient -r "$NET_IFACE" >/dev/null 2>&1
+      fi
       pkill -f "dhcpcd.*${NET_IFACE}" >/dev/null 2>&1
-      dhclient -r "$NET_IFACE" >/dev/null 2>&1
       ip addr flush dev "$NET_IFACE" >/dev/null 2>&1
       ifup "$NET_IFACE"
       ;;
@@ -1589,9 +1608,13 @@ fi
 n=0
 while [ "$n" -lt 6 ]; do
   if tester_connectivite; then
-    journal "Démarrage avec l'IP fixe : réseau fonctionnel, garde-fou désarmé."
-    mkdir -p "$(dirname "${CONFIRMED_FLAG}")"
-    touch "${CONFIRMED_FLAG}"
+    # Le garde-fou protège LE PREMIER DÉMARRAGE suivant le changement : sa
+    # mission est terminée, il se retire. Il ne marque surtout PAS le changement
+    # comme confirmé : seule la commande ip-fixe-confirmer, lancée par
+    # l'administrateur, a ce pouvoir. Se désarmer n'est pas confirmer.
+    # Le laisser en place indéfiniment serait dangereux : une panne réseau sans
+    # rapport, des mois plus tard, ferait revenir le serveur au DHCP tout seul.
+    journal "Démarrage avec l'IP fixe : réseau fonctionnel. Garde-fou de démarrage retiré (le changement reste à confirmer avec « ip-fixe-confirmer »)."
     systemctl disable ip-fixe-watchdog.service >/dev/null 2>&1
     rm -f /etc/systemd/system/ip-fixe-watchdog.service
     systemctl daemon-reload >/dev/null 2>&1
