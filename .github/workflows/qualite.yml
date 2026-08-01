@@ -1,0 +1,44 @@
+name: Qualité du script
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verification:
+    name: Syntaxe, ShellCheck et tests unitaires
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installation de ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Vérification de la syntaxe Bash
+        run: |
+          bash -n script-de-personnalisation-post-installation-pour-debian-13.sh
+          bash -n tests/test-fonctions.sh
+
+      - name: ShellCheck
+        run: |
+          # SC2317 (« commande inatteignable ») est désactivé : ShellCheck ne voit
+          # pas les fonctions appelées indirectement via run_cmd "$@".
+          shellcheck -s bash -e SC2317 \
+            script-de-personnalisation-post-installation-pour-debian-13.sh \
+            tests/test-fonctions.sh
+
+      - name: Tests unitaires des fonctions pures
+        run: bash tests/test-fonctions.sh
+
+      - name: Vérification du bit exécutable
+        run: |
+          if [ ! -x script-de-personnalisation-post-installation-pour-debian-13.sh ]; then
+            echo "Le script doit être exécutable (git update-index --chmod=+x)." >&2
+            exit 1
+          fi
