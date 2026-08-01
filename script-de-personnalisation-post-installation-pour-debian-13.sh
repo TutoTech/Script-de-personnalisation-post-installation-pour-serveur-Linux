@@ -2202,7 +2202,12 @@ ssh_reload_config() {
     systemctl restart ssh.service >/dev/null 2>&1 && return 0
     return 1
   fi
-  systemctl try-reload-or-restart ssh.service >/dev/null 2>&1 || true
+
+  # ssh.service inactif : il n'y a rien à recharger, et surtout rien à
+  # DÉMARRER. En activation par socket, c'est ssh.socket qui tient le port ;
+  # lancer ssh.service ici le lui disputerait. Et sans activation par socket,
+  # un service arrêté signifie qu'aucun sshd ne tourne : la nouvelle
+  # configuration sera lue à son prochain démarrage.
   return 0
 }
 
