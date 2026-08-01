@@ -1,5 +1,5 @@
 # Script-de-personnalisation-post-installation-pour-serveur-Linux
-Script Bash d'automatisation post-installation pour serveur Debian 13 (Trixie). Configure rapidement les essentiels : clavier FR, IP fixe avec vérification et retour automatique au DHCP, coloration syntaxique, création d'utilisateur sudo et sécurisation SSH. Idéal pour transformer une installation minimale en environnement prêt à l'emploi.
+Script Bash d'automatisation post-installation pour serveur Debian 13 (Trixie). Configure rapidement les essentiels : clavier FR, IP fixe avec vérification et retour automatique au DHCP, coloration syntaxique, création d'utilisateur sudo, sécurisation SSH et authentification par clé (génération d'une paire côté client, dépôt de la clé publique côté serveur). Idéal pour transformer une installation minimale en environnement prêt à l'emploi.
 
 ---
 
@@ -11,7 +11,7 @@ Ce script Bash est conçu pour automatiser la configuration initiale d'un serveu
 
 ### 🛠 Fonctionnalités
 
-Le script traite les sept étapes essentielles de la mise en service d'un serveur :
+Le script traite les huit étapes essentielles de la mise en service d'un serveur :
 
 1. **Confort visuel** : Activation de la coloration syntaxique pour l'utilisateur `root` (Prompt PS1, `ls`, `grep`).
 2. **Mise à jour système** : Actualisation complète des paquets (`apt-get update` & `upgrade`), en mode strictement non interactif.
@@ -20,6 +20,50 @@ Le script traite les sept étapes essentielles de la mise en service d'un serveu
 5. **Réseau statique** : Configuration d'une IP fixe **dans le gestionnaire réseau déjà en place**, avec vérification préalable et retour automatique au DHCP en cas de problème.
 6. **Sécurité Utilisateur** : Création d'un utilisateur standard avec privilèges `sudo` pour éviter l'usage de root.
 7. **Durcissement SSH** : Changement du port d'écoute (compatible avec l'activation par socket de Debian 13) et configuration de l'accès root.
+8. **Authentification par clé** : Génération d'une paire de clés si la machine est un **client**, dépôt d'une clé publique dans `authorized_keys` si c'est un **serveur**, puis durcissement facultatif avec retour automatique en cas de problème.
+
+### 🔑 Authentification par clé SSH
+
+L'étape 8 demande d'abord le **rôle de la machine**, puis déroule la branche correspondante — ou les deux, pour un poste rebond.
+
+**Machine cliente — génération d'une paire de clés**
+
+| Choix proposé | Détail |
+|---|---|
+| Compte propriétaire | La clé est créée dans le répertoire personnel de ce compte, avec ses droits (l'utilisateur créé à l'étape 6 est proposé par défaut) |
+| Type | `ed25519` (recommandé), `rsa 4096` (vieux équipements), `ecdsa 521`, ou `ed25519-sk` pour une clé matérielle FIDO2 — avec repli proposé sur `ed25519` si aucun jeton ne répond |
+| Emplacement et nom | Répertoire et nom de fichier libres, validés (chemin absolu, pas de `..`, pas de suffixe `.pub`) |
+| Phrase de passe | Demandée par `ssh-keygen` lui-même, **jamais passée en argument** : la ligne de commande d'un processus est lisible par tous via `ps` |
+| Commentaire | Pour reconnaître la clé des mois plus tard dans un `authorized_keys` qui en compte plusieurs |
+| Raccourci `~/.ssh/config` | Bloc idempotent `Host` / `HostName` / `User` / `Port` / `IdentityFile` / `IdentitiesOnly` / `AddKeysToAgent` : la connexion devient `ssh monserveur` |
+| Envoi immédiat | `ssh-copy-id` vers un serveur distant, suivi d'un **test de connexion réel** |
+
+Une clé existante n'est **jamais écrasée en silence** : le script propose un autre nom, ou une sauvegarde préalable.
+
+**Serveur — dépôt d'une clé publique**
+
+La clé peut être collée, lue dans un fichier, téléchargée depuis une URL `https`, importée depuis un compte GitHub (`https://github.com/<login>.keys`), ou reprise de la paire générée à l'instant. Une entrée « je n'ai pas encore de clé » affiche les commandes à lancer sur le poste client.
+
+Chaque clé est vérifiée avant installation : type reconnu (les clés DSA, refusées par OpenSSH depuis la version 7, sont écartées), corps base64 cohérent avec le type annoncé, refus explicite d'une clé **privée** collée par erreur, suppression des retours chariot d'un copier-coller Windows. Le dépôt est **idempotent** : une clé déjà présente n'est pas ajoutée une seconde fois, même si son commentaire diffère.
+
+Le script vérifie ensuite ce qui empêche réellement une clé de fonctionner :
+
+* droits `700` sur `~/.ssh`, `600` sur `authorized_keys`, propriétaire correct ;
+* **`StrictModes`** : si le répertoire personnel ou `.ssh` est accessible en écriture au groupe ou à tous, `sshd` ignore la clé **sans aucun message** — le script le détecte et propose la correction ;
+* saut de ligne final garanti, sans quoi la clé suivante viendrait se coller à la précédente et les invaliderait toutes les deux ;
+* `AuthorizedKeysFile` réellement en vigueur, relu via `sshd -T` ;
+* **test de connexion en boucle locale** quand une clé privée est disponible : la seule preuve possible depuis le serveur.
+
+**Durcissement et garde-fou anti-lockout**
+
+`PubkeyAuthentication yes` est posé systématiquement. La désactivation du mot de passe (`PasswordAuthentication no` **et** `KbdInteractiveAuthentication no`, sans quoi la coupure serait illusoire sur Debian) n'est proposée qu'après une connexion par clé prouvée ou une confirmation explicite, et le résultat est vérifié via `sshd -T` — si un fichier de `/etc/ssh/sshd_config.d/` numéroté avant le nôtre l'emporte, le script le nomme au lieu d'annoncer un succès qui n'a pas eu lieu.
+
+Comme pour le changement d'IP, un **retour automatique est armé avant la modification** : sans confirmation dans le délai choisi, le mot de passe est réactivé tout seul.
+
+| Commande | Rôle |
+|---|---|
+| `ssh-cles-confirmer` | Valide le durcissement et désarme le retour automatique |
+| `ssh-cles-rollback` | Réactive immédiatement l'authentification par mot de passe |
 
 ### 🛡 Comment le changement d'IP est sécurisé
 
@@ -100,7 +144,7 @@ This Bash script is designed to automate the initial configuration of a fresh **
 
 ### 🛠 Features
 
-The script automates seven critical setup steps:
+The script automates eight critical setup steps:
 
 1. **Shell Enhancement**: Enables syntax highlighting for the `root` user (PS1 prompt, `ls`, `grep` aliases).
 2. **System Update**: Full package list update and upgrade (`apt-get update` & `upgrade`), strictly non-interactive.
@@ -109,6 +153,50 @@ The script automates seven critical setup steps:
 5. **Static Networking**: Sets up a static IP address **in whichever network stack is already in place**, with pre-flight verification and automatic DHCP rollback.
 6. **User Security**: Creates a standard non-root user with `sudo` privileges.
 7. **SSH Hardening**: Changes the listening port (socket-activation aware, as required on Debian 13) and configures root login.
+8. **Key-based authentication**: Generates a key pair when the machine is a **client**, installs a public key into `authorized_keys` when it is a **server**, then optionally hardens `sshd` with an automatic rollback.
+
+### 🔑 SSH key authentication
+
+Step 8 first asks for the **machine's role**, then runs the matching branch — or both, for a jump host.
+
+**Client machine — key pair generation**
+
+| Option | Details |
+|---|---|
+| Owning account | The key is created in that account's home directory, with its ownership (the user created in step 6 is offered by default) |
+| Type | `ed25519` (recommended), `rsa 4096` (legacy gear), `ecdsa 521`, or `ed25519-sk` for a FIDO2 hardware token — with a fallback to `ed25519` offered when no token answers |
+| Location and name | Free choice of directory and filename, validated (absolute path, no `..`, no `.pub` suffix) |
+| Passphrase | Prompted by `ssh-keygen` itself, **never passed as an argument**: a process command line is world-readable through `ps` |
+| Comment | So the key stays identifiable months later in an `authorized_keys` holding several |
+| `~/.ssh/config` shortcut | Idempotent block with `Host` / `HostName` / `User` / `Port` / `IdentityFile` / `IdentitiesOnly` / `AddKeysToAgent`, turning the connection into `ssh myserver` |
+| Immediate deployment | `ssh-copy-id` to a remote server, followed by a **real connection test** |
+
+An existing key is **never silently overwritten**: the script offers another name, or a backup first.
+
+**Server — installing a public key**
+
+The key can be pasted, read from a file, downloaded over `https`, imported from a GitHub account (`https://github.com/<login>.keys`), or taken from the pair just generated. A "I don't have a key yet" entry prints the commands to run on the client machine.
+
+Every key is checked before installation: recognised type (DSA keys, rejected by OpenSSH since version 7, are turned down), base64 body consistent with the announced type, explicit refusal of a **private** key pasted by mistake, and stripping of carriage returns from a Windows copy-paste. Installation is **idempotent**: a key already present is not added twice, even if its comment differs.
+
+The script then checks what actually stops a key from working:
+
+* `700` on `~/.ssh`, `600` on `authorized_keys`, correct ownership;
+* **`StrictModes`**: if the home directory or `.ssh` is group- or world-writable, `sshd` ignores the key **with no message at all** — the script detects this and offers to fix it;
+* a guaranteed trailing newline, without which the next key would be glued to the previous one, invalidating both;
+* the effective `AuthorizedKeysFile`, read back through `sshd -T`;
+* a **loopback connection test** whenever a private key is available — the only proof obtainable from the server itself.
+
+**Hardening and lockout safeguard**
+
+`PubkeyAuthentication yes` is always set. Disabling passwords (`PasswordAuthentication no` **and** `KbdInteractiveAuthentication no`, without which the change would be illusory on Debian) is only offered after a proven key login or an explicit confirmation, and the result is verified through `sshd -T` — if a file in `/etc/ssh/sshd_config.d/` sorting before ours wins, the script names it instead of reporting a success that did not happen.
+
+As with the IP change, an **automatic rollback is armed before the change**: without confirmation within the chosen delay, password authentication is re-enabled on its own.
+
+| Command | Purpose |
+|---|---|
+| `ssh-cles-confirmer` | Confirms the hardening and disarms the automatic rollback |
+| `ssh-cles-rollback` | Immediately re-enables password authentication |
 
 ### 🛡 How the IP change is made safe
 
