@@ -201,6 +201,114 @@ egal "directive absente ajoutée"         "MaxAuthTries 3" "$(grep -E '^MaxAuthT
 egal "aucune duplication de Port"        "1" "$(grep -c '^Port ' "$TMP_SSHD")"
 rm -f "$TMP_SSHD"
 
+echo "== v_port =="
+ok "22 accepté"                          v_port 22
+ok "65535 accepté"                       v_port 65535
+ko "0 refusé"                            v_port 0
+ko "65536 refusé"                        v_port 65536
+ko "valeur non numérique refusée"        v_port deux-mille
+ko "valeur vide refusée"                 v_port ""
+
+################################################################################
+# Clés SSH
+################################################################################
+# Les trois clés ci-dessous sont de VRAIES clés publiques (générées puis
+# jetées) : les valider sur des chaînes inventées ne prouverait rien.
+CLE_ED25519="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFJM/PVmU6wnjFPK/7WRI6hUDZFEMRDygr7hBQ3XU1zx jean@portable"
+CLE_RSA="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCRBwVnwPS0sl0FLV1ZxzyHh920LVCvEdWoM56bYapfCimE2AuYO86N+ok3ovm3nhxRVbyyG6vKGAgWlQylMDd+jzfCrgEomnQJqdeIqv2ZvT+bT8zw85l3u+LITDeGNVJTGXwJzrjLWVYSedkYs1Tci6zlouU//OF5Jp+WYmEZK4M/zLZlXc+bssMvMTOk9C5m7onFDFButTdnIcKg3+CoCTQ2TCPY9ssAc/1d50eg5ivSg2O83uatnfu6rwbMGbjsDkaoO3Hg3pKQwiWP5g3IzwjI/LWNBTDMzL6vGD8E8jqoSOHU5vE/XjN/iKAl+7s+nU4tP45CLy51aScyLc9b admin@poste"
+CLE_ECDSA="ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAEnSrXNITxpNG5sr+3tRA/MmadiXh3rCIcXn8QIj8tDXJ1sBRAhHdhMonZ70KzExCdVcmLy5h2LvTbkXESGiWfnyQB5qAChJpZKIsaY6Ig87lPRNEFSUHCWBEVZ1hNCYxfaJuHWaib0NFC1SwcSX0SqkrzFTWUKrRNovsvQdhiGIybvww== ops@nas"
+
+echo "== ssh_pubkey_b64_prefix (entête base64 déduite du type) =="
+egal "ssh-ed25519"    "AAAAC3NzaC1lZDI1NTE5" "$(ssh_pubkey_b64_prefix ssh-ed25519)"
+egal "ssh-rsa"        "AAAAB3NzaC1y"         "$(ssh_pubkey_b64_prefix ssh-rsa)"
+egal "ecdsa-nistp521" "AAAAE2VjZHNhLXNoYTItbmlzdHA1" "$(ssh_pubkey_b64_prefix ecdsa-sha2-nistp521)"
+
+echo "== is_ssh_pubkey =="
+ok "clé ed25519 réelle"                  is_ssh_pubkey "$CLE_ED25519"
+ok "clé rsa réelle"                      is_ssh_pubkey "$CLE_RSA"
+ok "clé ecdsa réelle"                    is_ssh_pubkey "$CLE_ECDSA"
+ok "sans commentaire"                    is_ssh_pubkey "${CLE_ED25519% *}"
+ok "clé FIDO2 (sk-)"                     is_ssh_pubkey "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIKPXn1TfPmM6z0dGqk+8vXcCEplGCyMQ2m3rIcQ7WEc7 jean@yubikey"
+ko "chaîne vide"                         is_ssh_pubkey ""
+ko "texte quelconque"                    is_ssh_pubkey "bonjour tout le monde"
+ko "clé DSA obsolète"                    is_ssh_pubkey "ssh-dss AAAAB3NzaC1kc3MAAACBAJ7bpKHLcMTBLcMTBLcMTBLcMTBLcMTBLc9k user@old"
+ko "type seul, sans corps"               is_ssh_pubkey "ssh-ed25519"
+ko "corps tronqué"                       is_ssh_pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1 jean@portable"
+ko "caractère interdit dans le corps"    is_ssh_pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFJM/PVmU6wnjFPK!7WRI6hUDZFEMRDygr7hBQ3XU1zx x@y"
+# Contrôle croisé : le type annoncé ne correspond pas au contenu du blob.
+ko "type rsa sur un corps ed25519"       is_ssh_pubkey "ssh-rsa ${CLE_ED25519#* }"
+# Les options en début de ligne (command=, no-pty...) ne sont pas gérées : une
+# option mal recopiée passerait inaperçue.
+ko "ligne préfixée d'options"            is_ssh_pubkey "command=\"/bin/true\" $CLE_ED25519"
+
+echo "== v_pubkey (validateur de saisie) =="
+ok "clé publique valide"                 v_pubkey "$CLE_ED25519"
+ko "clé privée collée par erreur"        v_pubkey "-----BEGIN OPENSSH PRIVATE KEY-----"
+ko "chemin de fichier au lieu d'une clé" v_pubkey "/home/jean/.ssh/id_ed25519.pub"
+ko "clé DSA refusée explicitement"       v_pubkey "ssh-dss AAAAB3NzaC1kc3MAAACBAJ7bpKHLcMTBLcMTBLcMTBLcMTBLcMTBLc9k user@old"
+
+echo "== ssh_pubkey_type / ssh_pubkey_body =="
+egal "type ed25519"   "ssh-ed25519" "$(ssh_pubkey_type "$CLE_ED25519")"
+egal "corps ed25519"  "AAAAC3NzaC1lZDI1NTE5AAAAIFJM/PVmU6wnjFPK/7WRI6hUDZFEMRDygr7hBQ3XU1zx" "$(ssh_pubkey_body "$CLE_ED25519")"
+
+echo "== v_key_name =="
+ok "id_ed25519"                          v_key_name id_ed25519
+ok "cle-sauvegarde_2026"                 v_key_name cle-sauvegarde_2026
+ko "chemin refusé"                       v_key_name ".ssh/id_ed25519"
+ko "suffixe .pub refusé"                 v_key_name id_ed25519.pub
+ko "tiret en tête refusé"                v_key_name -f
+ko "espace refusé"                       v_key_name "ma cle"
+ko "nom vide refusé"                     v_key_name ""
+ko "plus de 64 caractères refusé"        v_key_name "$(printf 'a%.0s' $(seq 1 65))"
+
+echo "== v_abs_dir =="
+ok "/home/jean/.ssh"                     v_abs_dir /home/jean/.ssh
+ok "/root/.ssh"                          v_abs_dir /root/.ssh
+ko "chemin relatif refusé"               v_abs_dir .ssh
+ko "remontée .. refusée"                 v_abs_dir /home/jean/../root/.ssh
+ko "espace refusé"                       v_abs_dir "/home/jean/mes cles"
+
+echo "== v_user_name / v_ssh_host / v_ssh_alias =="
+ok "jdupont"                             v_user_name jdupont
+ok "srv_admin"                           v_user_name srv_admin
+ko "majuscule refusée"                   v_user_name Jean
+ko "point refusé"                        v_user_name j.dupont
+ko "plus de 32 caractères refusé"        v_user_name "$(printf 'u%.0s' $(seq 1 33))"
+ok "nom d'hôte"                          v_ssh_host serveur.example.org
+ok "adresse IPv4"                        v_ssh_host 192.168.1.10
+ok "adresse IPv6"                        v_ssh_host 2606:4700:4700::1111
+ko "espace refusé"                       v_ssh_host "mon serveur"
+ko "hôte vide refusé"                    v_ssh_host ""
+ok "alias simple"                        v_ssh_alias monserveur
+ko "alias avec espace refusé"            v_ssh_alias "mon serveur"
+
+echo "== authkeys_contains =="
+TMP_AUTH="$(mktemp)"
+printf '%s\n' "$CLE_ED25519" > "$TMP_AUTH"
+ok "clé identique détectée"              authkeys_contains "$TMP_AUTH" "$CLE_ED25519"
+# Le commentaire varie d'une machine à l'autre : la comparaison porte sur le
+# corps de la clé, sinon la même clé serait ajoutée en double.
+ok "même clé, autre commentaire"         authkeys_contains "$TMP_AUTH" "${CLE_ED25519% *} autre-commentaire"
+ko "autre clé non détectée"              authkeys_contains "$TMP_AUTH" "$CLE_RSA"
+ko "fichier inexistant"                  authkeys_contains "$TMP_AUTH-absent" "$CLE_ED25519"
+printf '# %s\n' "$CLE_RSA" >> "$TMP_AUTH"
+ko "clé en commentaire ignorée"          authkeys_contains "$TMP_AUTH" "$CLE_RSA"
+rm -f "$TMP_AUTH"
+
+echo "== ensure_trailing_newline =="
+# Sans saut de ligne final, la clé suivante viendrait se coller à la dernière :
+# les deux deviendraient invalides.
+TMP_AUTH="$(mktemp)"
+printf 'premiere-ligne' > "$TMP_AUTH"
+ensure_trailing_newline "$TMP_AUTH"
+egal "saut de ligne ajouté"              "1" "$(grep -c '^premiere-ligne$' "$TMP_AUTH")"
+ensure_trailing_newline "$TMP_AUTH"
+egal "pas de ligne vide en trop"         "1" "$(wc -l < "$TMP_AUTH" | tr -d ' ')"
+: > "$TMP_AUTH"
+ensure_trailing_newline "$TMP_AUTH"
+egal "fichier vide laissé vide"          "0" "$(wc -c < "$TMP_AUTH" | tr -d ' ')"
+rm -f "$TMP_AUTH"
+
 echo "== run_cmd (propagation du code retour) =="
 # Non-régression : bash remet $? à 0 après un « if commande ; then » dont la
 # condition échoue. Une capture naïve du code retour ferait passer un échec pour

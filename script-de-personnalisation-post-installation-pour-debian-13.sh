@@ -15,6 +15,8 @@
 # - Configuration d'une IP fixe (ifupdown, systemd-networkd ou NetworkManager)
 # - Création d'un utilisateur standard avec droits sudo
 # - Sécurisation SSH (changement de port, désactivation accès root)
+# - Authentification par clé SSH : génération d'une paire de clés (machine
+#   cliente) et/ou dépôt d'une clé publique dans authorized_keys (serveur)
 #
 # SÉCURITÉ DU CHANGEMENT D'ADRESSE IP
 # -----------------------------------
@@ -35,6 +37,15 @@
 #      confirmation explicite (« sudo ip-fixe-confirmer ») dans le délai
 #      imparti, le serveur restaure tout seul sa configuration précédente.
 #      Un garde-fou équivalent surveille le premier redémarrage.
+#
+# SÉCURITÉ DU DURCISSEMENT SSH
+# ----------------------------
+# Couper l'authentification par mot de passe alors que la clé publique n'est
+# pas réellement exploitable est l'autre façon classique de se verrouiller
+# dehors. Le même principe s'applique donc : la désactivation n'est proposée
+# qu'après une preuve (test de connexion par clé) ou une confirmation
+# explicite, et un retour automatique est armé — sans « sudo ssh-cles-confirmer »
+# dans le délai imparti, le mot de passe est réactivé tout seul.
 #
 # Prérequis : Accès root (sudo)
 # Compatible : Debian 13 (Trixie) serveur minimal
@@ -103,6 +114,7 @@ GATEWAY=""
 DNS_SERVERS=""
 STANDARD_USER=""
 SSH_PORT=""
+SSH_ROLE=""              # serveur | client | deux | aucun
 
 # --- Drapeaux d'état réels (utilisés par le récapitulatif final) ---------------
 # Ils ne valent 1 que si l'action a RÉELLEMENT abouti : le récapitulatif ne doit
@@ -118,6 +130,20 @@ USER_CREATED=0
 SKIP_SSH_CONFIG="false"
 SSH_PORT_APPLIED=0
 SCRIPT_ERRORS=0
+
+# --- Authentification par clé (étape 8) ----------------------------------------
+KEY_GENERATED=0
+KEY_PATH=""             # chemin de la clé PRIVÉE générée
+KEY_PUB_PATH=""         # chemin de la clé publique correspondante
+KEY_OWNER=""            # compte propriétaire de la paire
+KEY_HAS_PASSPHRASE=0
+AUTHKEY_ADDED=0
+AUTHKEY_USER=""
+AUTHKEY_COUNT=0
+KEY_LOGIN_TESTED=0      # 1 uniquement si une connexion par clé a RÉELLEMENT abouti
+PASSWORD_AUTH_DISABLED=0
+SSH_AUTH_ROLLBACK_ARMED=0
+SSH_AUTH_ROLLBACK_DELAY=10
 
 # --- Contexte réseau détecté ---------------------------------------------------
 NET_STACK=""            # ifupdown | networkd | networkmanager
@@ -138,6 +164,11 @@ NET_BACKUP_MODE=0
 ROLLBACK_STATE="$STATE_DIR/rollback.env"
 CONFIRMED_FLAG="$STATE_DIR/confirmed"
 RUNTIME_CONFIRMED_FLAG="/run/personnalisation-debian13.confirmed"
+# État et drapeau propres au durcissement SSH : ils sont volontairement
+# SÉPARÉS de ceux du réseau, pour qu'une confirmation d'IP ne désarme pas le
+# retour arrière SSH (et réciproquement).
+SSH_AUTH_STATE="$STATE_DIR/ssh-auth.env"
+SSH_AUTH_CONFIRMED_FLAG="$STATE_DIR/ssh-auth-confirmed"
 RUN_STAMP="$(date +%Y%m%d-%H%M%S)"
 
 # --- Divers --------------------------------------------------------------------
@@ -341,6 +372,18 @@ backup_file() {
   fi
   log_ok "Sauvegarde : $dst"
   return 0
+}
+
+# Sauvegarde UNE SEULE FOIS par exécution. Le nom de la sauvegarde contient
+# l'horodatage du lancement (et non celui de l'appel) : rappeler backup_file sur
+# un fichier déjà sauvegardé écraserait la copie d'origine par la version déjà
+# modifiée, et le retour arrière ne restaurerait plus l'état initial. C'est le
+# cas des fichiers sshd, touchés à l'étape 7 puis de nouveau à l'étape 8.
+backup_file_once() {
+  local src="${1:-}"
+  [[ -n "$src" ]] || return 1
+  [[ -e "${src}.bak.${RUN_STAMP}" ]] && return 0
+  backup_file "$src"
 }
 
 restore_file() {
@@ -663,12 +706,20 @@ v_hostname() {
   return 0
 }
 
-v_ssh_port() {
+# Validation de PLAGE uniquement : utilisable aussi pour le port d'un serveur
+# DISTANT, où les vérifications locales (port déjà occupé ici) n'ont aucun sens.
+v_port() {
   local port="${1:-}"
   if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
     log_warn "« $port » n'est pas un port valide (1-65535)."
     return 1
   fi
+  return 0
+}
+
+v_ssh_port() {
+  local port="${1:-}"
+  v_port "$port" || return 1
   if (( port != 22 )) && (( port < 1024 )); then
     log_warn "Le port $port est réservé aux services système et peut entrer en conflit."
     ask_yes_no "  L'utiliser quand même ?" "n" || return 1
@@ -1831,6 +1882,1624 @@ sshd_target_file() {
 }
 
 ################################################################################
+# SECTION H — AUTHENTIFICATION PAR CLÉ SSH
+################################################################################
+# Deux faces du même mécanisme :
+#   - côté CLIENT  : générer une paire de clés (privée gardée sur la machine,
+#                    publique déposée sur les serveurs) ;
+#   - côté SERVEUR : inscrire une clé publique dans ~/.ssh/authorized_keys.
+#
+# Les validateurs sont volontairement PURS : ils n'appellent ni ssh-keygen, ni
+# le réseau, ni le système. La suite de tests peut ainsi les éprouver sur
+# n'importe quelle machine, y compris sans OpenSSH installé.
+################################################################################
+
+################################################################################
+# FONCTION : Reconnaissance d'une clé publique OpenSSH
+################################################################################
+# « ssh-dss » (DSA) est volontairement ABSENT de la liste : OpenSSH le refuse
+# par défaut depuis la version 7.0 et l'a retiré en 9.8. L'accepter donnerait
+# une clé installée mais définitivement inutilisable — le pire des cas, puisque
+# l'utilisateur croirait son accès en place.
+################################################################################
+SSH_PUBKEY_TYPES='ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com'
+
+ssh_pubkey_type() { printf '%s' "${1:-}" | awk '{ print $1 }'; }
+ssh_pubkey_body() { printf '%s' "${1:-}" | awk '{ print $2 }'; }
+
+################################################################################
+# FONCTION : Début attendu du base64 pour un type de clé donné
+################################################################################
+# Le contenu binaire d'une clé publique OpenSSH commence toujours par la
+# longueur du nom de l'algorithme (4 octets) suivie du nom lui-même. Son
+# encodage base64 est donc entièrement prévisible : « ssh-ed25519 » commence
+# forcément par « AAAAC3NzaC1lZDI1NTE5 ».
+#
+# Ce contrôle croisé écarte les lignes dont l'entête a été bricolée à la main
+# (type recopié devant le corps d'une autre clé), que la seule vérification du
+# format ne repérerait pas.
+#
+# Seuls les caractères issus de groupes de 3 octets COMPLETS sont stables : les
+# suivants dépendent déjà des octets de la clé elle-même.
+################################################################################
+ssh_pubkey_b64_prefix() {
+  local type="${1:-}" n b64 groupes
+  [[ -n "$type" ]] || return 1
+  command -v base64 >/dev/null 2>&1 || return 1
+  n=${#type}
+  (( n > 0 && n < 256 )) || return 1
+  b64="$(printf '%b%s' "\\0000\\0000\\0000\\0$(printf '%03o' "$n")" "$type" | base64 2>/dev/null | tr -d '\n')" || return 1
+  [[ -n "$b64" ]] || return 1
+  # Nombre de groupes de 3 octets complets, puis 4 caractères base64 par groupe.
+  groupes=$(( (4 + n) / 3 ))
+  printf '%s' "${b64:0:$(( groupes * 4 ))}"
+}
+
+is_ssh_pubkey() {
+  local line="${1:-}" type body prefix
+
+  type="$(ssh_pubkey_type "$line")"
+  body="$(ssh_pubkey_body "$line")"
+  [[ -n "$type" && -n "$body" ]] || return 1
+
+  # Une ligne d'authorized_keys peut débuter par des options
+  # (« command="…",no-pty ssh-ed25519 AAAA… »). Ce script n'en pose pas et n'en
+  # accepte pas : une option mal recopiée est un risque de sécurité muet.
+  [[ "$type" =~ ^(${SSH_PUBKEY_TYPES})$ ]] || return 1
+
+  # Corps en base64 « standard », suffisamment long : un copier-coller tronqué
+  # au milieu de la clé est ainsi écarté.
+  [[ "$body" =~ ^[A-Za-z0-9+/]+={0,3}$ ]] || return 1
+  (( ${#body} >= 32 )) || return 1
+
+  # Si base64 n'est pas disponible, on s'en tient aux contrôles ci-dessus.
+  prefix="$(ssh_pubkey_b64_prefix "$type")" || return 0
+  [[ -n "$prefix" ]] || return 0
+  [[ "${body:0:${#prefix}}" == "$prefix" ]] || return 1
+  return 0
+}
+
+################################################################################
+# FONCTION : Validateur de clé publique (pour ask_input)
+################################################################################
+v_pubkey() {
+  local line="${1:-}" type
+
+  if [[ "$line" == *"PRIVATE KEY"* || "$line" == *"BEGIN OPENSSH"* ]]; then
+    log_err "C'est une clé PRIVÉE — ne la diffusez jamais, et changez-la si elle a circulé."
+    echo "  Le fichier attendu est celui qui se termine par « .pub »." >&2
+    return 1
+  fi
+
+  type="$(ssh_pubkey_type "$line")"
+
+  if [[ "$type" == "ssh-dss" ]]; then
+    log_warn "Les clés DSA (ssh-dss) sont refusées par OpenSSH depuis la version 7."
+    echo "  Générez une clé ed25519 à la place." >&2
+    return 1
+  fi
+
+  if [[ "$line" == /* || "$line" == ~* ]]; then
+    log_warn "Vous avez saisi un CHEMIN, pas une clé."
+    echo "  Utilisez l'option « lire depuis un fichier », ou collez le contenu" >&2
+    echo "  de la clé publique (une seule ligne, commençant par le type)." >&2
+    return 1
+  fi
+
+  if ! is_ssh_pubkey "$line"; then
+    log_warn "Ceci n'est pas une clé publique OpenSSH exploitable."
+    echo "  Attendu : « <type> <base64> [commentaire] », par exemple" >&2
+    echo "    ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... jean@portable" >&2
+    echo "  Types acceptés : ed25519, rsa, ecdsa, et leurs variantes FIDO2 (sk-)." >&2
+    return 1
+  fi
+  return 0
+}
+
+################################################################################
+# FONCTIONS : Validateurs de saisie liés aux clés
+################################################################################
+v_key_name() {
+  local name="${1:-}"
+  if [[ "$name" == */* ]]; then
+    log_warn "Indiquez seulement le NOM du fichier, sans « / » : l'emplacement est demandé à part."
+    return 1
+  fi
+  if (( ${#name} > 64 )); then
+    log_warn "Le nom du fichier ne doit pas dépasser 64 caractères."
+    return 1
+  fi
+  if [[ "$name" == *.pub ]]; then
+    log_warn "« .pub » désigne la clé PUBLIQUE : donnez le nom de base, le fichier .pub sera créé tout seul."
+    return 1
+  fi
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    log_warn "« $name » est invalide : lettres, chiffres, « . », « - » et « _ », en commençant par une lettre ou un chiffre."
+    return 1
+  fi
+  return 0
+}
+
+v_abs_dir() {
+  local dir="${1:-}"
+  if [[ "$dir" != /* ]]; then
+    log_warn "Indiquez un chemin ABSOLU, commençant par « / » (exemple : /home/jean/.ssh)."
+    return 1
+  fi
+  if [[ "$dir" =~ (^|/)\.\.(/|$) ]]; then
+    log_warn "Le chemin ne doit pas contenir « .. »."
+    return 1
+  fi
+  if [[ "$dir" =~ [[:space:]] ]]; then
+    log_warn "Évitez les espaces dans un chemin de clé SSH : plusieurs outils les gèrent mal."
+    return 1
+  fi
+  if [[ -e "$dir" && ! -d "$dir" ]]; then
+    log_warn "« $dir » existe déjà et n'est pas un répertoire."
+    return 1
+  fi
+  return 0
+}
+
+# Format d'un nom de compte UNIX, sans vérifier son existence : utilisé pour le
+# compte d'un serveur DISTANT, que cette machine ne connaît pas.
+v_user_name() {
+  local user="${1:-}"
+  if (( ${#user} > 32 )) || [[ ! "$user" =~ ^[a-z_][a-z0-9_-]*\$?$ ]]; then
+    log_warn "« $user » n'est pas un nom d'utilisateur valide."
+    return 1
+  fi
+  return 0
+}
+
+# Comptes susceptibles d'ouvrir une session : root et les comptes humains.
+ssh_login_users() {
+  getent passwd 2>/dev/null |
+    awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 65000)) { print $1 }'
+}
+
+v_ssh_user() {
+  local user="${1:-}"
+  v_user_name "$user" || return 1
+  if ! getent passwd "$user" >/dev/null 2>&1; then
+    log_warn "Le compte « $user » n'existe pas sur cette machine."
+    echo "  Comptes disponibles : $(ssh_login_users | tr '\n' ' ')" >&2
+    return 1
+  fi
+  return 0
+}
+
+v_ssh_host() {
+  local host="${1:-}"
+  is_ipaddr "$host" && return 0
+  if (( ${#host} <= 253 )) && [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+    return 0
+  fi
+  log_warn "« $host » n'est ni un nom d'hôte ni une adresse IP valide."
+  return 1
+}
+
+v_ssh_alias() {
+  local name="${1:-}"
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    log_warn "L'alias doit être un mot simple, sans espace (exemple : monserveur)."
+    return 1
+  fi
+  return 0
+}
+
+################################################################################
+# FONCTION : La clé est-elle déjà présente dans un authorized_keys ?
+################################################################################
+# La comparaison porte sur le CORPS de la clé, jamais sur la ligne entière : le
+# commentaire final varie d'une machine à l'autre, et comparer les lignes
+# créerait des doublons pour une seule et même clé.
+################################################################################
+authkeys_contains() {
+  local file="${1:-}" line="${2:-}" body
+  [[ -f "$file" ]] || return 1
+  body="$(ssh_pubkey_body "$line")"
+  [[ -n "$body" ]] || return 1
+  awk -v b="$body" '
+    /^[[:space:]]*#/ { next }
+    { for (i = 1; i <= NF; i++) if ($i == b) { found = 1; exit } }
+    END { exit !found }
+  ' "$file"
+}
+
+################################################################################
+# FONCTION : Garantir un saut de ligne final
+################################################################################
+# Un authorized_keys dont la dernière ligne n'est pas terminée par un saut de
+# ligne colle la clé suivante à la précédente : les DEUX deviennent invalides,
+# et l'utilisateur perd un accès qui fonctionnait.
+#
+# Astuce : la substitution de commande retire les sauts de ligne finaux. Si le
+# résultat est vide, c'est que le dernier octet en était un.
+################################################################################
+ensure_trailing_newline() {
+  local file="${1:-}"
+  [[ -n "$file" ]] || return 1
+  [[ -s "$file" ]] || return 0
+  if [[ -n "$(tail -c 1 "$file" 2>/dev/null)" ]]; then
+    printf '\n' >> "$file"
+  fi
+  return 0
+}
+
+################################################################################
+# FONCTIONS : Renseignements sur un compte
+################################################################################
+# Le répertoire personnel est lu dans la base des comptes, jamais déduit de
+# « /home/<user> » : celui de root est /root, et un compte peut avoir un home
+# ailleurs.
+################################################################################
+ssh_user_home() {
+  local home
+  home="$(getent passwd "${1:-}" 2>/dev/null | cut -d: -f6)"
+  [[ -n "$home" ]] || return 1
+  printf '%s' "$home"
+}
+
+ssh_user_group() {
+  local group
+  group="$(id -gn "${1:-}" 2>/dev/null)" || return 1
+  printf '%s' "$group"
+}
+
+ssh_user_shell() {
+  getent passwd "${1:-}" 2>/dev/null | cut -d: -f7
+}
+
+################################################################################
+# FONCTION : Valeur RÉELLEMENT appliquée d'une directive sshd
+################################################################################
+# « sshd -T » donne la configuration effective, tous fichiers inclus. C'est le
+# seul moyen fiable de vérifier qu'une directive a bien pris : sshd retient la
+# PREMIÈRE valeur rencontrée, et un fichier déposé par une image cloud dans
+# /etc/ssh/sshd_config.d/ peut très bien l'emporter sur la nôtre.
+################################################################################
+sshd_effective() {
+  local key="${1:-}" bin out
+  [[ -n "$key" ]] || return 1
+  bin="$(command -v sshd || echo /usr/sbin/sshd)"
+  [[ -x "$bin" ]] || return 1
+  # Un bloc « Match » peut exiger un contexte de connexion : on le fournit en
+  # deuxième tentative plutôt que d'abandonner.
+  out="$("$bin" -T 2>/dev/null)" ||
+    out="$("$bin" -T -C "user=root,host=localhost,addr=127.0.0.1" 2>/dev/null)" ||
+    return 1
+  printf '%s\n' "$out" | awk -v k="${key,,}" '$1 == k { $1 = ""; sub(/^ /, ""); print; exit }'
+}
+
+################################################################################
+# FONCTION : Quel fichier impose une directive ?
+################################################################################
+# Sert à expliquer pourquoi une directive posée par le script reste sans effet.
+################################################################################
+sshd_directive_sources() {
+  local key="${1:-}"
+  [[ -n "$key" ]] || return 1
+  grep -rliE "^[[:space:]]*${key}[[:space:]]" \
+    /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null | sort
+}
+
+################################################################################
+# FONCTION : Prise en compte d'une nouvelle configuration sshd
+################################################################################
+# En activation par socket, sshd n'est pas un service résident : chaque
+# connexion démarre un processus neuf qui relit la configuration. Il n'y a donc
+# rien à recharger — et « systemctl reload ssh » échouerait, le service n'étant
+# pas actif.
+################################################################################
+ssh_reload_config() {
+  local bin
+  bin="$(command -v sshd || echo /usr/sbin/sshd)"
+  "$bin" -t 2>/dev/null || return 1
+
+  if systemctl is-active --quiet ssh.service 2>/dev/null; then
+    systemctl reload ssh.service >/dev/null 2>&1 && return 0
+    systemctl restart ssh.service >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  systemctl try-reload-or-restart ssh.service >/dev/null 2>&1 || true
+  return 0
+}
+
+################################################################################
+# FONCTION : Port SSH réellement en écoute
+################################################################################
+ssh_listen_port() {
+  local port="" listen
+
+  if (( SSH_PORT_APPLIED )) && [[ -n "$SSH_PORT" ]]; then
+    printf '%s' "$SSH_PORT"
+    return 0
+  fi
+  if ssh_socket_active; then
+    listen="$(systemctl show ssh.socket --property=Listen --value 2>/dev/null | head -n1)"
+    port="$(printf '%s' "$listen" | sed -n -E 's/.*:([0-9]+).*/\1/p')"
+  fi
+  [[ -n "$port" ]] || port="$(sshd_effective port 2>/dev/null | awk 'NR == 1 { print $1 }')"
+  [[ "$port" =~ ^[0-9]+$ ]] || port="22"
+  printf '%s' "$port"
+}
+
+################################################################################
+# FONCTION : Adresse à afficher dans les exemples de reconnexion
+################################################################################
+# current_ipv4 renvoie une chaîne vide (et non un code d'erreur) quand aucune
+# adresse n'est trouvée : un « || echo <ip> » ne se déclencherait donc jamais.
+# On garantit ici qu'un exemple de commande n'est jamais tronqué.
+################################################################################
+adresse_affichable() {
+  local addr="${STATIC_IP_BARE:-}"
+  [[ -n "$addr" ]] || addr="$(current_ipv4 "${INTERFACE:-}")"
+  [[ -n "$addr" ]] || addr="<ip-du-serveur>"
+  printf '%s' "$addr"
+}
+
+################################################################################
+# FONCTION : Empreinte d'une clé
+################################################################################
+ssh_fingerprint_file() {
+  local file="${1:-}"
+  command -v ssh-keygen >/dev/null 2>&1 || return 1
+  ssh-keygen -l -f "$file" 2>/dev/null
+}
+
+ssh_fingerprint_line() {
+  local line="${1:-}" tmp out=""
+  command -v ssh-keygen >/dev/null 2>&1 || return 1
+  tmp="$(mktemp)" || return 1
+  printf '%s\n' "$line" > "$tmp"
+  out="$(ssh-keygen -l -f "$tmp" 2>/dev/null)" || out=""
+  rm -f "$tmp"
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
+################################################################################
+# FONCTION : Exécution sous l'identité d'un utilisateur
+################################################################################
+# Le terminal est conservé : ssh-keygen doit pouvoir demander la phrase de
+# passe, et ssh-copy-id le mot de passe distant. Générer directement sous le
+# bon compte évite en outre toute erreur de propriétaire.
+################################################################################
+ssh_run_as() {
+  local user="${1:-}"
+  shift
+  [[ -n "$user" && $# -gt 0 ]] || return 1
+  if [[ "$user" == "root" ]] || ! command -v runuser >/dev/null 2>&1; then
+    "$@"
+    return $?
+  fi
+  runuser -u "$user" -- "$@"
+}
+
+################################################################################
+# FONCTION : Répertoire personnel présent et attribué
+################################################################################
+# Un compte système, ou un compte créé avec --no-create-home, n'a pas forcément
+# de répertoire personnel : sans lui, aucun ~/.ssh n'est possible.
+################################################################################
+ensure_home_dir() {
+  local user="${1:-}" home="${2:-}" group
+  [[ -n "$user" && -n "$home" ]] || return 1
+  [[ -d "$home" ]] && return 0
+  group="$(ssh_user_group "$user")" || group="$user"
+
+  if ! mkdir -p "$home"; then
+    log_err "Création de $home impossible."
+    return 1
+  fi
+  chown "$user:$group" "$home" 2>/dev/null || log_warn "Impossible de donner $home au compte $user."
+  chmod 750 "$home" 2>/dev/null || true
+  log_ok "Répertoire personnel créé : $home"
+  return 0
+}
+
+################################################################################
+# FONCTION : Répertoire .ssh aux bons droits
+################################################################################
+ensure_ssh_dir() {
+  local user="${1:-}" dir="${2:-}" group
+  [[ -n "$user" && -n "$dir" ]] || return 1
+  group="$(ssh_user_group "$user")" || group="$user"
+
+  if [[ ! -d "$dir" ]]; then
+    if ! mkdir -p "$dir"; then
+      log_err "Impossible de créer le répertoire $dir"
+      return 1
+    fi
+    log_ok "Répertoire créé : $dir"
+  fi
+  chmod 700 "$dir" || log_warn "Impossible d'appliquer les droits 700 sur $dir."
+  chown "$user:$group" "$dir" 2>/dev/null || log_warn "Impossible de donner $dir au compte $user."
+  return 0
+}
+
+################################################################################
+# FONCTION : Contrôle des droits exigés par sshd (StrictModes)
+################################################################################
+# Avec StrictModes (actif par défaut), sshd IGNORE authorized_keys si le
+# répertoire personnel ou .ssh est accessible en écriture au groupe ou à tous.
+# Aucun message n'apparaît côté client : c'est la première cause de « ma clé ne
+# marche pas » alors que tout semble correct.
+################################################################################
+check_strict_modes() {
+  local path perms
+  for path in "$@"; do
+    [[ -d "$path" ]] || continue
+    perms="$(stat -c '%a' "$path" 2>/dev/null)" || continue
+    [[ "$perms" =~ ^[0-7]+$ ]] || continue
+    if (( 8#$perms & 8#22 )); then
+      echo ""
+      log_warn "« $path » est accessible en écriture au groupe ou à tous (droits $perms)."
+      echo "  Dans ce cas, sshd ignore purement et simplement la clé : la connexion"
+      echo "  échouerait sans explication côté client."
+      if ask_yes_no "  Corriger maintenant (chmod go-w $path) ?" "o"; then
+        if chmod go-w "$path"; then
+          log_ok "Droits corrigés : $path est maintenant en $(stat -c '%a' "$path" 2>/dev/null)."
+        else
+          log_err "Correction impossible sur $path."
+        fi
+      fi
+    fi
+  done
+  return 0
+}
+
+################################################################################
+# FONCTION : Outils de retour arrière du durcissement SSH
+################################################################################
+# Même principe que pour l'IP fixe : couper l'authentification par mot de passe
+# alors que la clé n'est pas réellement exploitable verrouille l'utilisateur
+# dehors. Deux commandes sont installées :
+#
+#   ssh-cles-rollback   réactive le mot de passe si rien n'a été confirmé ;
+#   ssh-cles-confirmer  valide le durcissement et désarme la minuterie.
+#
+# L'état est SÉPARÉ de celui du réseau : confirmer l'IP fixe ne doit pas
+# désarmer le garde-fou SSH, et réciproquement.
+################################################################################
+install_ssh_auth_tools() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || return 1
+
+  mkdir -p "$STATE_DIR" || return 1
+  # Un drapeau laissé par une exécution précédente désarmerait immédiatement le
+  # garde-fou qui commence.
+  rm -f "$SSH_AUTH_CONFIRMED_FLAG"
+
+  cat > "$SSH_AUTH_STATE" <<EOF
+# État du durcissement SSH — généré le $(date)
+SSHD_TARGET='${target}'
+SSHD_TARGET_BACKUP='${target}.bak.${RUN_STAMP}'
+SSHD_MAIN_BACKUP='/etc/ssh/sshd_config.bak.${RUN_STAMP}'
+CONFIRMED_FLAG='${SSH_AUTH_CONFIRMED_FLAG}'
+EOF
+  chmod 600 "$SSH_AUTH_STATE"
+
+  cat > /usr/local/sbin/ssh-cles-rollback <<'ROLLBACK'
+#!/bin/bash
+# Réactive l'authentification par mot de passe tant que le durcissement n'a pas
+# été confirmé. Généré par le script de personnalisation Debian 13.
+set -u
+STATE_FILE="/var/lib/personnalisation-debian13/ssh-auth.env"
+
+journal() { logger -t ssh-cles "$*" 2>/dev/null; echo "$*"; }
+
+[ -r "$STATE_FILE" ] || { journal "État introuvable : $STATE_FILE"; exit 1; }
+# shellcheck disable=SC1090
+. "$STATE_FILE"
+
+if [ -e "${CONFIRMED_FLAG:-/var/lib/personnalisation-debian13/ssh-auth-confirmed}" ]; then
+  journal "Durcissement confirmé : aucun retour arrière."
+  exit 0
+fi
+
+# Même logique que set_sshd_directive, réécrite ici : cet outil doit rester
+# autonome, il survit au script qui l'a installé.
+poser_directive() {
+  file="$1"; key="$2"; value="$3"
+  if [ ! -e "$file" ]; then
+    printf '%s %s\n' "$key" "$value" > "$file"
+    chmod 644 "$file"
+    return 0
+  fi
+  if grep -qiE "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]" "$file"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]].*|${key} ${value}|I" "$file"
+  else
+    printf '%s %s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+journal "Durcissement SSH non confirmé : réactivation de l'authentification par mot de passe."
+poser_directive "$SSHD_TARGET" PasswordAuthentication yes
+poser_directive "$SSHD_TARGET" KbdInteractiveAuthentication yes
+
+SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
+if ! "$SSHD_BIN" -t 2>/dev/null; then
+  journal "Configuration invalide après réécriture : restauration de la sauvegarde."
+  [ -e "${SSHD_TARGET_BACKUP:-}" ] && cp -a "$SSHD_TARGET_BACKUP" "$SSHD_TARGET"
+  [ -e "${SSHD_MAIN_BACKUP:-}" ] && cp -a "$SSHD_MAIN_BACKUP" /etc/ssh/sshd_config
+fi
+
+if systemctl is-active --quiet ssh.service 2>/dev/null; then
+  systemctl reload ssh.service >/dev/null 2>&1 || systemctl restart ssh.service >/dev/null 2>&1
+fi
+
+if "$SSHD_BIN" -T 2>/dev/null | grep -qi '^passwordauthentication yes'; then
+  journal "Le mot de passe est de nouveau accepté."
+else
+  journal "ATTENTION : le mot de passe n'a PAS pu être réactivé. Un accès console est nécessaire."
+fi
+exit 0
+ROLLBACK
+  chmod 755 /usr/local/sbin/ssh-cles-rollback
+
+  cat > /usr/local/sbin/ssh-cles-confirmer <<'CONFIRM'
+#!/bin/bash
+# Valide le durcissement SSH et désarme le retour automatique.
+# Généré par le script de personnalisation Debian 13.
+set -u
+STATE_FILE="/var/lib/personnalisation-debian13/ssh-auth.env"
+FLAG="/var/lib/personnalisation-debian13/ssh-auth-confirmed"
+
+if [ -r "$STATE_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$STATE_FILE"
+  FLAG="${CONFIRMED_FLAG:-$FLAG}"
+fi
+
+mkdir -p "$(dirname "$FLAG")"
+: > "$FLAG"
+systemctl stop ssh-cles-rollback.timer >/dev/null 2>&1
+systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1
+logger -t ssh-cles "Durcissement SSH confirmé par l'administrateur." 2>/dev/null
+
+echo "✓ Durcissement confirmé : l'authentification par mot de passe reste désactivée."
+echo "  Pour la réactiver plus tard : sudo ssh-cles-rollback"
+exit 0
+CONFIRM
+  chmod 755 /usr/local/sbin/ssh-cles-confirmer
+
+  return 0
+}
+
+################################################################################
+# FONCTION : Explication de l'authentification par clé
+################################################################################
+afficher_explication_cles() {
+  clear
+  echo "=========================================="
+  echo "  EXPLICATION : L'AUTHENTIFICATION PAR CLÉ"
+  echo "=========================================="
+  echo ""
+  echo "Une paire de clés, ce sont DEUX fichiers indissociables :"
+  echo ""
+  echo "  - la clé PRIVÉE (ex. id_ed25519) reste sur VOTRE machine. Elle ne"
+  echo "    doit JAMAIS être copiée sur un serveur ni envoyée par courriel."
+  echo "  - la clé PUBLIQUE (ex. id_ed25519.pub) se dépose sur les serveurs,"
+  echo "    dans le fichier ~/.ssh/authorized_keys du compte visé. Elle peut"
+  echo "    être diffusée sans risque."
+  echo ""
+  echo "À la connexion, le serveur envoie un défi que seule la clé privée sait"
+  echo "résoudre. Le secret ne circule donc jamais sur le réseau."
+  echo ""
+  echo "POURQUOI C'EST NETTEMENT PLUS SÛR QU'UN MOT DE PASSE :"
+  echo "  - un mot de passe se devine, se rejoue, se tape sur un faux serveur ;"
+  echo "  - une clé de 256 bits ne se force pas par essais successifs ;"
+  echo "  - les robots qui scannent le port SSH testent des mots de passe :"
+  echo "    sans mot de passe accepté, leurs tentatives deviennent inutiles ;"
+  echo "  - la connexion devient automatisable (sauvegardes, scripts) sans"
+  echo "    écrire de mot de passe en clair quelque part."
+  echo ""
+  echo "LA PHRASE DE PASSE :"
+  echo "  Elle chiffre la clé privée SUR LE DISQUE. Si le fichier est volé, il"
+  echo "  reste inutilisable. C'est la protection du dernier recours, et elle"
+  echo "  ne se tape qu'une fois par session grâce à l'agent SSH."
+  echo ""
+  echo "QUI FAIT QUOI :"
+  echo "  - machine CLIENTE (votre poste)  → on y GÉNÈRE la paire de clés ;"
+  echo "  - SERVEUR (cette machine ?)      → on y DÉPOSE la clé publique."
+  echo ""
+  echo "=========================================="
+  echo ""
+}
+
+################################################################################
+# FONCTION : Aide « je n'ai pas encore de clé »
+################################################################################
+# Affichée côté serveur : les commandes à lancer sur le POSTE CLIENT pour
+# obtenir une clé publique à coller ensuite ici.
+################################################################################
+afficher_aide_creation_cliente() {
+  local port user
+  port="$(ssh_listen_port)"
+  user="${STANDARD_USER:-utilisateur}"
+
+  echo ""
+  echo "------------------------------------------------------------------"
+  echo "  À FAIRE SUR VOTRE POSTE (pas sur ce serveur)"
+  echo "------------------------------------------------------------------"
+  echo ""
+  echo "  Linux ou macOS — dans un terminal :"
+  echo ""
+  echo "      ssh-keygen -t ed25519 -C \"\$USER@\$(hostname)\""
+  echo "      cat ~/.ssh/id_ed25519.pub"
+  echo ""
+  echo "  Windows 10/11 — dans PowerShell :"
+  echo ""
+  echo "      ssh-keygen -t ed25519"
+  echo "      type \$env:USERPROFILE\\.ssh\\id_ed25519.pub"
+  echo ""
+  echo "  Copiez la ligne affichée (elle commence par « ssh-ed25519 ») puis"
+  echo "  revenez ici et choisissez « la coller »."
+  echo ""
+  echo "  Variante entièrement automatique, depuis votre poste, une fois le"
+  echo "  mot de passe encore actif :"
+  echo ""
+  echo "      ssh-copy-id -p $port $user@$(adresse_affichable)"
+  echo ""
+  echo "------------------------------------------------------------------"
+  echo ""
+}
+
+################################################################################
+# FONCTION : Test RÉEL d'une connexion par clé
+################################################################################
+# C'est la seule preuve acceptable avant de couper le mot de passe. En cas de
+# succès, KEY_LOGIN_TESTED passe à 1 et débloque le durcissement.
+################################################################################
+tester_connexion_cle() {
+  local owner="${1:-}" key="${2:-}" remote_user="${3:-}" host="${4:-}" port="${5:-22}"
+  local out rc=0
+  local -a opts
+
+  [[ -n "$owner" && -n "$key" && -n "$remote_user" && -n "$host" ]] || return 1
+  if ! command -v ssh >/dev/null 2>&1; then
+    log_warn "La commande « ssh » est indisponible : test impossible."
+    return 1
+  fi
+
+  opts=(-i "$key" -p "$port"
+        -o ConnectTimeout=10
+        -o StrictHostKeyChecking=accept-new
+        -o IdentitiesOnly=yes
+        -o PreferredAuthentications=publickey)
+
+  if (( KEY_HAS_PASSPHRASE )); then
+    echo ""
+    log_info "La clé est protégée par une phrase de passe : elle va vous être demandée."
+  else
+    # Sans phrase de passe, rien ne doit être demandé : BatchMode transforme
+    # toute invite en échec franc plutôt qu'en attente silencieuse.
+    opts+=(-o BatchMode=yes)
+  fi
+
+  log_info "Test de connexion : $remote_user@$host (port $port)..."
+  out="$(ssh_run_as "$owner" ssh "${opts[@]}" "$remote_user@$host" true 2>&1)" || rc=$?
+
+  if (( rc == 0 )); then
+    log_ok "CONNEXION PAR CLÉ RÉUSSIE vers $remote_user@$host."
+    KEY_LOGIN_TESTED=1
+    return 0
+  fi
+
+  log_err "La connexion par clé a échoué (code $rc)."
+  [[ -n "$out" ]] && printf '%s\n' "$out" | sed -e 's/^/    /' >&2
+  echo "  Pistes à vérifier :"
+  echo "    - clé publique absente du authorized_keys du compte visé ;"
+  echo "    - droits trop larges sur le répertoire personnel ou sur .ssh ;"
+  echo "    - port, pare-feu, ou compte sans shell de connexion ;"
+  echo "    - compte verrouillé (« passwd -S $remote_user » affiche « L ») :"
+  echo "      un compte sans mot de passe défini peut être refusé avant même"
+  echo "      l'examen de la clé."
+  return 1
+}
+
+################################################################################
+# FONCTION : Entrée de raccourci dans ~/.ssh/config
+################################################################################
+# Permet de se connecter par « ssh monserveur » sans réécrire le port, le
+# compte ni le chemin de la clé. Le bloc est encadré par des marqueurs : une
+# nouvelle exécution le remplace au lieu de l'empiler.
+################################################################################
+configurer_ssh_config() {
+  local user="${1:-}" home="${2:-}" key="${3:-}"
+  local cfg alias_name host remote_user port group
+
+  cfg="$home/.ssh/config"
+  echo ""
+  echo "Un alias évite de retaper le port, le compte et le chemin de la clé :"
+  echo "  ssh monserveur   au lieu de   ssh -i $key -p 2222 admin@192.168.1.10"
+  echo ""
+
+  ask_input "Alias de connexion" "monserveur" v_ssh_alias
+  alias_name="$ASK_VALUE"
+  ask_input "Nom d'hôte ou adresse IP du serveur" "${STATIC_IP_BARE:-}" v_ssh_host
+  host="$ASK_VALUE"
+  ask_input "Compte à utiliser sur le serveur" "$user" v_user_name
+  remote_user="$ASK_VALUE"
+  ask_input "Port SSH du serveur" "$(ssh_listen_port)" v_port
+  port="$ASK_VALUE"
+
+  ensure_ssh_dir "$user" "$home/.ssh" || return 1
+  [[ -e "$cfg" ]] && backup_file_once "$cfg"
+
+  write_marked_block "$cfg" \
+    "# >>> personnalisation-debian13 (alias $alias_name) >>>" \
+    "# <<< personnalisation-debian13 (alias $alias_name) <<<" <<EOF
+Host $alias_name
+    HostName $host
+    User $remote_user
+    Port $port
+    IdentityFile $key
+    # N'essaie QUE cette clé : sans cela, ssh présente toutes les identités
+    # connues et peut dépasser MaxAuthTries avant d'arriver à la bonne.
+    IdentitiesOnly yes
+    # Charge la clé dans l'agent au premier usage : la phrase de passe n'est
+    # alors demandée qu'une fois par session.
+    AddKeysToAgent yes
+EOF
+
+  group="$(ssh_user_group "$user")" || group="$user"
+  chmod 600 "$cfg" 2>/dev/null || true
+  chown "$user:$group" "$cfg" 2>/dev/null || true
+
+  echo ""
+  if command -v ssh >/dev/null 2>&1 && ssh_run_as "$user" ssh -G "$alias_name" >/dev/null 2>&1; then
+    log_ok "Alias « $alias_name » écrit dans $cfg et relu sans erreur par ssh."
+  else
+    log_ok "Alias « $alias_name » écrit dans $cfg."
+  fi
+  echo "  Connexion : ssh $alias_name"
+  return 0
+}
+
+################################################################################
+# FONCTION : Envoi de la clé publique vers un serveur distant
+################################################################################
+deployer_cle_distante() {
+  local user="${1:-}" pub="${2:-}" key="${3:-}"
+  local host remote_user port rc=0
+
+  if ! need_cmd ssh-copy-id openssh-client; then
+    log_warn "« ssh-copy-id » est indisponible : envoi automatique impossible."
+    echo "  Méthode manuelle, depuis cette machine :"
+    echo "    cat $pub | ssh <user>@<serveur> 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys'"
+    return 1
+  fi
+
+  echo ""
+  ask_input "Adresse ou nom du serveur distant" "" v_ssh_host
+  host="$ASK_VALUE"
+  ask_input "Compte sur ce serveur" "$user" v_user_name
+  remote_user="$ASK_VALUE"
+  ask_input "Port SSH du serveur" "22" v_port
+  port="$ASK_VALUE"
+
+  echo ""
+  log_info "Envoi de la clé publique vers $remote_user@$host (port $port)..."
+  echo "  Le MOT DE PASSE du compte distant va vous être demandé : c'est"
+  echo "  normal, c'est la dernière fois."
+  echo ""
+
+  ssh_run_as "$user" ssh-copy-id \
+    -i "$pub" -p "$port" \
+    -o ConnectTimeout=10 \
+    -o StrictHostKeyChecking=accept-new \
+    "$remote_user@$host" || rc=$?
+
+  echo ""
+  if (( rc != 0 )); then
+    log_err "L'envoi a échoué (code $rc)."
+    echo "  Vérifiez l'adresse, le port, le compte, et que le serveur distant"
+    echo "  accepte encore l'authentification par mot de passe."
+    return 1
+  fi
+
+  log_ok "Clé publique déposée sur $remote_user@$host."
+  echo ""
+  if ask_yes_no "Tester tout de suite la connexion par clé ?" "o"; then
+    tester_connexion_cle "$user" "$key" "$remote_user" "$host" "$port" || return 1
+  fi
+  return 0
+}
+
+################################################################################
+# FONCTION : Génération d'une paire de clés (machine CLIENTE)
+################################################################################
+generer_paire_cles() {
+  local user home group dir name comment type bits nom_defaut
+  local key_path pub_path choix with_pass=1 rc=0 tentative=1
+  local -a cmd
+
+  banner "GÉNÉRATION D'UNE PAIRE DE CLÉS SSH"
+
+  if ! need_cmd ssh-keygen openssh-client; then
+    log_err "« ssh-keygen » est introuvable et le paquet openssh-client n'a pas pu être installé."
+    echo "  Aucune clé ne peut être générée sur cette machine."
+    SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+    return 1
+  fi
+
+  # --- Compte propriétaire ------------------------------------------------------
+  local defaut_user="root"
+  if (( USER_CREATED )) && [[ -n "$STANDARD_USER" ]]; then
+    defaut_user="$STANDARD_USER"
+  fi
+
+  echo "La clé appartiendra à un compte précis : elle sera créée dans SON"
+  echo "répertoire personnel, avec ses droits."
+  echo "  Comptes disponibles : $(ssh_login_users | tr '\n' ' ')"
+  echo ""
+  ask_input "Compte propriétaire de la clé" "$defaut_user" v_ssh_user
+  user="$ASK_VALUE"
+
+  if ! home="$(ssh_user_home "$user")"; then
+    log_err "Impossible de déterminer le répertoire personnel de « $user »."
+    return 1
+  fi
+  group="$(ssh_user_group "$user")" || group="$user"
+
+  if [[ ! -d "$home" ]]; then
+    log_warn "Le répertoire personnel « $home » n'existe pas encore."
+    ask_yes_no "Le créer ?" "o" || return 1
+    ensure_home_dir "$user" "$home" || return 1
+  fi
+
+  # --- Type de clé --------------------------------------------------------------
+  echo ""
+  echo "TYPE DE CLÉ :"
+  echo "  1. ed25519     Recommandé. Court, rapide, très sûr, standard depuis"
+  echo "                 des années sur tous les systèmes à jour."
+  echo "  2. rsa 4096    Pour dialoguer avec de vieux équipements (NAS, switchs,"
+  echo "                 serveurs antérieurs à 2014) qui ignorent ed25519."
+  echo "  3. ecdsa 521   Rarement utile ; parfois imposé par une norme interne."
+  echo "  4. ed25519-sk  Clé matérielle FIDO2 (YubiKey…) : le secret ne quitte"
+  echo "                 jamais le jeton, qui doit être branché MAINTENANT."
+  echo ""
+  if ! read -r -p "Votre choix (1/2/3/4) [1] : " choix; then
+    choix="1"
+    echo ""
+  fi
+  case "${choix:-1}" in
+    2) type="rsa";        bits="4096"; nom_defaut="id_rsa" ;;
+    3) type="ecdsa";      bits="521";  nom_defaut="id_ecdsa" ;;
+    4) type="ed25519-sk"; bits="";     nom_defaut="id_ed25519_sk" ;;
+    *) type="ed25519";    bits="";     nom_defaut="id_ed25519" ;;
+  esac
+
+  # --- Emplacement et nom -------------------------------------------------------
+  echo ""
+  echo "Par convention les clés vivent dans ~/.ssh, mais tout emplacement"
+  echo "accessible au compte convient (un support chiffré, par exemple)."
+  echo ""
+  ask_input "Emplacement (répertoire) de la clé" "$home/.ssh" v_abs_dir
+  dir="$ASK_VALUE"
+  ask_input "Nom du fichier de la clé" "$nom_defaut" v_key_name
+  name="$ASK_VALUE"
+  key_path="$dir/$name"
+  pub_path="$key_path.pub"
+
+  # --- Jamais d'écrasement silencieux -------------------------------------------
+  while [[ -e "$key_path" || -e "$pub_path" ]]; do
+    echo ""
+    log_warn "Un fichier porte déjà ce nom : $key_path"
+    echo "  Écraser une clé privée existante rend DÉFINITIVEMENT inutilisables"
+    echo "  tous les accès qui reposent dessus."
+    echo ""
+    echo "  1. Choisir un autre nom (recommandé)"
+    echo "  2. Sauvegarder l'existant, puis écraser"
+    echo "  3. Annuler la génération"
+    echo ""
+    if ! read -r -p "Votre choix (1/2/3) [1] : " choix; then
+      choix="3"
+      echo ""
+    fi
+    case "${choix:-1}" in
+      2)
+        backup_file "$key_path"
+        backup_file "$pub_path"
+        rm -f "$key_path" "$pub_path"
+        ;;
+      3)
+        log_info "Génération annulée."
+        return 1
+        ;;
+      *)
+        ask_input "Nouveau nom du fichier de la clé" "${name}-2" v_key_name
+        name="$ASK_VALUE"
+        key_path="$dir/$name"
+        pub_path="$key_path.pub"
+        ;;
+    esac
+  done
+
+  # --- Commentaire --------------------------------------------------------------
+  echo ""
+  echo "Le commentaire est inscrit en clair dans la clé : il sert à reconnaître"
+  echo "sa provenance des mois plus tard, dans un authorized_keys qui en compte"
+  echo "plusieurs."
+  echo ""
+  ask_input "Commentaire" "$user@$(hostname)-$(date +%Y%m%d)" "" yes
+  comment="$ASK_VALUE"
+
+  ensure_ssh_dir "$user" "$dir" || return 1
+
+  # --- Phrase de passe ----------------------------------------------------------
+  echo ""
+  echo "PHRASE DE PASSE :"
+  echo "  Elle chiffre la clé privée sur le disque. Sans elle, quiconque met la"
+  echo "  main sur le fichier obtient immédiatement vos accès (sauvegarde"
+  echo "  égarée, disque revendu, compte compromis)."
+  echo "  Une clé SANS phrase ne se justifie que pour l'automatisation."
+  echo ""
+  ask_yes_no "Protéger la clé par une phrase de passe ?" "o" || with_pass=0
+
+  # --- Génération ---------------------------------------------------------------
+  while true; do
+    cmd=(ssh-keygen -t "$type" -f "$key_path" -C "$comment")
+    [[ -n "$bits" ]] && cmd+=(-b "$bits")
+
+    if (( with_pass )); then
+      echo ""
+      echo "ssh-keygen va demander la phrase DEUX FOIS, en anglais :"
+      echo "    « Enter passphrase »            → saisissez votre phrase"
+      echo "    « Enter same passphrase again » → saisissez-la à nouveau"
+      echo "  Rien ne s'affiche pendant la frappe, c'est normal."
+      echo ""
+      # La phrase n'est JAMAIS passée par l'option -N : la ligne de commande
+      # d'un processus est lisible de tous (« ps », /proc). C'est ssh-keygen
+      # lui-même qui la demande, directement sur le terminal.
+    else
+      cmd+=(-N "")
+    fi
+
+    rc=0
+    ssh_run_as "$user" "${cmd[@]}" || rc=$?
+    if (( rc == 0 )) && [[ -f "$key_path" && -f "$pub_path" ]]; then
+      break
+    fi
+
+    echo ""
+    log_err "La génération a échoué (code $rc)."
+
+    # Repli 1 : la bascule d'identité peut être en cause (runuser absent d'un
+    # conteneur, PAM restrictif). On retente en root, quitte à corriger le
+    # propriétaire juste après.
+    if (( tentative == 1 )) && [[ "$user" != "root" ]] && [[ ! -e "$key_path" ]]; then
+      tentative=2
+      log_info "Nouvelle tentative en root ; les fichiers seront ensuite donnés à $user."
+      rc=0
+      "${cmd[@]}" || rc=$?
+      if (( rc == 0 )) && [[ -f "$key_path" && -f "$pub_path" ]]; then
+        break
+      fi
+      log_err "La seconde tentative a également échoué (code $rc)."
+    fi
+
+    # Repli 2 : une clé « -sk » exige un jeton FIDO2 branché et libfido2.
+    if [[ "$type" == *-sk ]]; then
+      echo "  Les clés « -sk » nécessitent un jeton FIDO2 branché, le paquet"
+      echo "  libfido2-1, et un jeton qui accepte l'algorithme demandé."
+      echo ""
+      if ask_yes_no "Générer plutôt une clé ed25519 logicielle ?" "o"; then
+        type="ed25519"
+        bits=""
+        tentative=1
+        rm -f "$key_path" "$pub_path"
+        continue
+      fi
+    fi
+
+    SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+    return 1
+  done
+
+  # --- Droits et propriétaire ---------------------------------------------------
+  chown "$user:$group" "$key_path" "$pub_path" 2>/dev/null ||
+    log_warn "Impossible de donner les fichiers de clé au compte $user."
+  chmod 600 "$key_path" 2>/dev/null || true
+  chmod 644 "$pub_path" 2>/dev/null || true
+
+  # --- Vérification RÉELLE ------------------------------------------------------
+  local perms proprio anomalie=0
+  perms="$(stat -c '%a' "$key_path" 2>/dev/null)"
+  proprio="$(stat -c '%U' "$key_path" 2>/dev/null)"
+  [[ "$perms" == "600" ]] || anomalie=1
+  [[ "$proprio" == "$user" ]] || anomalie=1
+
+  echo ""
+  if (( anomalie )); then
+    log_warn "Clé créée, mais ses attributs sont inattendus (droits $perms, propriétaire $proprio)."
+    echo "  Attendu : droits 600, propriétaire $user. ssh refuse d'utiliser une"
+    echo "  clé privée lisible par d'autres comptes."
+  else
+    log_ok "PAIRE DE CLÉS CRÉÉE"
+  fi
+
+  echo ""
+  echo "  Clé PRIVÉE   : $key_path"
+  echo "                 (droits $perms — à ne JAMAIS copier ailleurs)"
+  echo "  Clé PUBLIQUE : $pub_path"
+  echo "                 (à déposer sur les serveurs)"
+  local empreinte
+  if empreinte="$(ssh_fingerprint_file "$pub_path")"; then
+    echo "  Empreinte    : $empreinte"
+  fi
+  echo ""
+  echo "  Contenu de la clé PUBLIQUE, à copier telle quelle :"
+  echo "  ------------------------------------------------------------------"
+  sed -e 's/^/  /' "$pub_path"
+  echo "  ------------------------------------------------------------------"
+  echo ""
+
+  KEY_GENERATED=1
+  KEY_PATH="$key_path"
+  KEY_PUB_PATH="$pub_path"
+  KEY_OWNER="$user"
+  KEY_HAS_PASSPHRASE="$with_pass"
+
+  if (( with_pass )); then
+    echo "  Astuce : « ssh-add $key_path » charge la clé dans l'agent, la phrase"
+    echo "  de passe n'est alors demandée qu'une fois par session."
+    echo ""
+  fi
+
+  # --- Options complémentaires --------------------------------------------------
+  if ask_yes_no "Créer un raccourci de connexion dans ~/.ssh/config ?" "o"; then
+    configurer_ssh_config "$user" "$home" "$key_path" || true
+  fi
+
+  echo ""
+  if ask_yes_no "Envoyer dès maintenant cette clé publique vers un serveur distant ?" "n"; then
+    deployer_cle_distante "$user" "$pub_path" "$key_path" || true
+  fi
+
+  return 0
+}
+
+################################################################################
+# FONCTION : Collecte des clés publiques à installer (côté SERVEUR)
+################################################################################
+# Les clés retenues sont accumulées dans PUBKEYS_COLLECTED : un tableau ne peut
+# pas être renvoyé par une fonction en bash.
+################################################################################
+PUBKEYS_COLLECTED=()
+
+ajouter_cle_collectee() {
+  local line="${1:-}" silencieux="${2:-non}"
+
+  # Un copier-coller depuis Windows traîne des retours chariot, invisibles mais
+  # qui rendent la clé inutilisable.
+  line="${line//$'\r'/}"
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+
+  [[ -n "$line" ]] || return 1
+  [[ "$line" == \#* ]] && return 1
+
+  if ! is_ssh_pubkey "$line"; then
+    [[ "$silencieux" == "oui" ]] || log_warn "Ligne ignorée (clé publique non reconnue) : ${line:0:48}..."
+    return 1
+  fi
+
+  local existante
+  if (( ${#PUBKEYS_COLLECTED[@]} > 0 )); then
+    for existante in "${PUBKEYS_COLLECTED[@]}"; do
+      [[ "$(ssh_pubkey_body "$existante")" == "$(ssh_pubkey_body "$line")" ]] && return 1
+    done
+  fi
+
+  PUBKEYS_COLLECTED+=("$line")
+  return 0
+}
+
+################################################################################
+# FONCTION : Récupération de clés depuis un fichier ou une URL
+################################################################################
+importer_cles_fichier() {
+  local fichier="${1:-}" ajoutees=0 ligne
+
+  if [[ ! -r "$fichier" ]]; then
+    log_err "Fichier illisible ou inexistant : $fichier"
+    return 1
+  fi
+  while IFS= read -r ligne || [[ -n "$ligne" ]]; do
+    ajouter_cle_collectee "$ligne" "oui" && ajoutees=$((ajoutees + 1))
+  done < "$fichier"
+
+  if (( ajoutees == 0 )); then
+    log_err "Aucune clé publique exploitable dans $fichier."
+    return 1
+  fi
+  log_ok "$ajoutees clé(s) retenue(s) depuis $fichier."
+  return 0
+}
+
+telecharger_cles() {
+  local url="${1:-}" tmp rc=0
+
+  if [[ "$url" != https://* ]]; then
+    log_err "Seules les URL « https:// » sont acceptées (une clé récupérée en clair peut être remplacée en route)."
+    return 1
+  fi
+
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    need_cmd curl curl >/dev/null 2>&1 || true
+  fi
+
+  tmp="$(mktemp)" || return 1
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --proto '=https' --max-time 20 -o "$tmp" -- "$url" || rc=$?
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=20 -O "$tmp" -- "$url" || rc=$?
+  else
+    log_err "Ni curl ni wget ne sont disponibles : téléchargement impossible."
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if (( rc != 0 )); then
+    log_err "Téléchargement impossible depuis $url (code $rc)."
+    rm -f "$tmp"
+    return 1
+  fi
+
+  importer_cles_fichier "$tmp"
+  rc=$?
+  rm -f "$tmp"
+  return $rc
+}
+
+################################################################################
+# FONCTION : Dépôt d'une clé publique dans authorized_keys (côté SERVEUR)
+################################################################################
+installer_cle_publique() {
+  local user home group ssh_dir authfile choix shell_user
+  local ajoutees=0 ignorees=0 cle url login fichier
+
+  banner "DÉPÔT D'UNE CLÉ PUBLIQUE SUR CE SERVEUR"
+
+  if ! dpkg -s openssh-server >/dev/null 2>&1; then
+    log_warn "Le serveur SSH (openssh-server) n'est pas installé sur cette machine."
+    echo "  La clé peut tout de même être déposée : elle sera prise en compte"
+    echo "  dès l'installation du serveur."
+    echo ""
+  fi
+
+  # --- Compte destinataire ------------------------------------------------------
+  local defaut_user="root"
+  if (( USER_CREATED )) && [[ -n "$STANDARD_USER" ]]; then
+    defaut_user="$STANDARD_USER"
+  fi
+
+  echo "La clé publique autorise la connexion à UN compte précis de ce serveur."
+  echo "  Comptes disponibles : $(ssh_login_users | tr '\n' ' ')"
+  echo ""
+  ask_input "Compte autorisé par cette clé" "$defaut_user" v_ssh_user
+  user="$ASK_VALUE"
+
+  if ! home="$(ssh_user_home "$user")"; then
+    log_err "Impossible de déterminer le répertoire personnel de « $user »."
+    return 1
+  fi
+  group="$(ssh_user_group "$user")" || group="$user"
+
+  shell_user="$(ssh_user_shell "$user")"
+  if [[ "$shell_user" == *nologin || "$shell_user" == */false ]]; then
+    echo ""
+    log_warn "Le compte « $user » a pour shell « $shell_user » : il ne peut pas ouvrir de session."
+    echo "  La clé sera installée, mais la connexion SSH restera refusée."
+    ask_yes_no "Continuer quand même ?" "n" || return 1
+  fi
+
+  if [[ "$user" == "root" ]]; then
+    local root_login
+    root_login="$(sshd_effective permitrootlogin)"
+    if [[ "$root_login" == "no" ]]; then
+      echo ""
+      log_warn "La connexion SSH de root est actuellement DÉSACTIVÉE (PermitRootLogin no)."
+      echo "  La clé serait installée mais inutilisable en l'état."
+      echo ""
+      if ask_yes_no "Autoriser root UNIQUEMENT par clé (PermitRootLogin prohibit-password) ?" "n"; then
+        local cible
+        cible="$(sshd_target_file)"
+        backup_file_once /etc/ssh/sshd_config
+        [[ "$cible" != "/etc/ssh/sshd_config" ]] && backup_file_once "$cible"
+        set_sshd_directive "$cible" "PermitRootLogin" "prohibit-password"
+        if ssh_reload_config; then
+          log_ok "root pourra se connecter par clé, jamais par mot de passe."
+        else
+          log_err "Configuration refusée par sshd : modification à vérifier manuellement."
+          SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+        fi
+      fi
+    fi
+  fi
+
+  if [[ ! -d "$home" ]]; then
+    log_warn "Le répertoire personnel « $home » n'existe pas."
+    ask_yes_no "Le créer ?" "o" || return 1
+    ensure_home_dir "$user" "$home" || return 1
+  fi
+
+  # --- Collecte des clés --------------------------------------------------------
+  PUBKEYS_COLLECTED=()
+
+  while true; do
+    echo ""
+    echo "------------------------------------------"
+    echo "  PROVENANCE DE LA CLÉ PUBLIQUE"
+    echo "------------------------------------------"
+    echo "  1. La coller ici (une ligne, commençant par « ssh-ed25519 »…)"
+    echo "  2. La lire dans un fichier présent sur ce serveur"
+    echo "  3. La télécharger depuis une URL https"
+    echo "  4. L'importer depuis un compte GitHub"
+    if (( KEY_GENERATED )); then
+      echo "  5. Utiliser la clé générée à l'instant ($KEY_PUB_PATH)"
+    fi
+    echo "  6. Je n'ai pas encore de clé — m'expliquer comment en créer une"
+    echo "  0. Terminer la saisie (${#PUBKEYS_COLLECTED[@]} clé(s) retenue(s))"
+    echo ""
+    if ! read -r -p "Votre choix : " choix; then
+      choix="0"
+      echo ""
+    fi
+
+    case "$choix" in
+      1)
+        echo ""
+        echo "Collez la clé PUBLIQUE (une seule ligne), puis Entrée :"
+        ask_input "Clé publique" "" v_pubkey
+        if ajouter_cle_collectee "$ASK_VALUE"; then
+          log_ok "Clé retenue : $(ssh_fingerprint_line "$ASK_VALUE" || ssh_pubkey_type "$ASK_VALUE")"
+        else
+          log_info "Cette clé est déjà dans la liste."
+        fi
+        ;;
+      2)
+        echo ""
+        ask_input "Chemin du fichier contenant la ou les clés" "" ""
+        fichier="$ASK_VALUE"
+        importer_cles_fichier "$fichier" || true
+        ;;
+      3)
+        echo ""
+        ask_input "URL https de la clé publique" "" ""
+        url="$ASK_VALUE"
+        telecharger_cles "$url" || true
+        ;;
+      4)
+        echo ""
+        echo "GitHub publie les clés publiques d'un compte sur https://github.com/<login>.keys"
+        echo "⚠ N'importez que VOTRE compte : ces clés donneront un accès complet."
+        echo ""
+        ask_input "Identifiant GitHub" "" v_ssh_alias
+        login="$ASK_VALUE"
+        telecharger_cles "https://github.com/${login}.keys" || true
+        ;;
+      5)
+        if (( KEY_GENERATED )); then
+          importer_cles_fichier "$KEY_PUB_PATH" || true
+        else
+          log_warn "Aucune clé n'a été générée pendant cette exécution."
+        fi
+        ;;
+      6)
+        afficher_aide_creation_cliente
+        read -r -p "Appuyez sur Entrée pour revenir au menu..." _ || true
+        ;;
+      0)
+        break
+        ;;
+      *)
+        log_warn "Choix invalide."
+        ;;
+    esac
+  done
+
+  if (( ${#PUBKEYS_COLLECTED[@]} == 0 )); then
+    echo ""
+    log_info "Aucune clé publique n'a été fournie : rien n'est installé."
+    return 1
+  fi
+
+  # --- Récapitulatif et confirmation --------------------------------------------
+  echo ""
+  echo "------------------------------------------"
+  echo "  CLÉS À INSTALLER POUR « $user »"
+  echo "------------------------------------------"
+  for cle in "${PUBKEYS_COLLECTED[@]}"; do
+    echo "  - $(ssh_fingerprint_line "$cle" || printf '%s' "$(ssh_pubkey_type "$cle") ${cle:0:40}...")"
+  done
+  echo "------------------------------------------"
+  echo ""
+  echo "Chacune de ces clés donnera un accès complet au compte « $user »."
+  echo ""
+  if ! ask_yes_no "Installer ces clés dans $home/.ssh/authorized_keys ?" "o"; then
+    log_info "Installation annulée."
+    return 1
+  fi
+
+  # --- Installation -------------------------------------------------------------
+  ssh_dir="$home/.ssh"
+  ensure_ssh_dir "$user" "$ssh_dir" || return 1
+  authfile="$ssh_dir/authorized_keys"
+
+  if [[ -e "$authfile" ]]; then
+    backup_file_once "$authfile"
+  else
+    : > "$authfile"
+  fi
+  ensure_trailing_newline "$authfile"
+
+  for cle in "${PUBKEYS_COLLECTED[@]}"; do
+    if authkeys_contains "$authfile" "$cle"; then
+      ignorees=$((ignorees + 1))
+      continue
+    fi
+    if printf '%s\n' "$cle" >> "$authfile"; then
+      ajoutees=$((ajoutees + 1))
+    else
+      log_err "Écriture impossible dans $authfile"
+      SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+      return 1
+    fi
+  done
+
+  chmod 600 "$authfile" 2>/dev/null || log_warn "Impossible d'appliquer les droits 600 sur $authfile."
+  chown "$user:$group" "$authfile" 2>/dev/null || log_warn "Impossible de donner $authfile au compte $user."
+
+  echo ""
+  log_ok "$ajoutees clé(s) ajoutée(s), $ignorees déjà présente(s)."
+  echo "  Fichier : $authfile ($(stat -c '%a %U:%G' "$authfile" 2>/dev/null))"
+
+  if (( ajoutees > 0 )); then
+    AUTHKEY_ADDED=1
+    AUTHKEY_USER="$user"
+    AUTHKEY_COUNT=$((AUTHKEY_COUNT + ajoutees))
+  elif (( ignorees > 0 )) && ! (( AUTHKEY_ADDED )); then
+    # Les clés étaient déjà là : l'accès par clé est en place malgré tout.
+    AUTHKEY_ADDED=1
+    AUTHKEY_USER="$user"
+  fi
+
+  # --- Contrôles de bon fonctionnement ------------------------------------------
+  echo ""
+  log_info "Vérification des conditions exigées par sshd..."
+
+  local empreintes
+  if empreintes="$(ssh_fingerprint_file "$authfile")"; then
+    echo "  Clés effectivement lisibles par sshd :"
+    printf '%s\n' "$empreintes" | sed -e 's/^/    /'
+  else
+    log_warn "ssh-keygen ne parvient pas à relire $authfile : vérifiez son contenu."
+  fi
+
+  # « chmod go-w » suffit à satisfaire StrictModes, mais un .ssh reste un
+  # répertoire privé : on le remet à 700 quoi qu'il arrive.
+  check_strict_modes "$home" "$ssh_dir"
+  chmod 700 "$ssh_dir" 2>/dev/null || true
+
+  local akf
+  akf="$(sshd_effective authorizedkeysfile)"
+  if [[ -n "$akf" && "$akf" != *".ssh/authorized_keys"* ]]; then
+    log_warn "sshd ne lit PAS le fichier standard : AuthorizedKeysFile = $akf"
+    echo "  La clé vient d'être écrite dans $authfile, qui ne sera pas consulté."
+    echo "  Adaptez la directive ou déplacez le fichier avant de fermer cette session."
+  fi
+
+  # --- Preuve par le test --------------------------------------------------------
+  if (( KEY_GENERATED )) && [[ -f "$KEY_PATH" ]]; then
+    echo ""
+    echo "Un test en boucle locale (127.0.0.1) permet de PROUVER que la"
+    echo "connexion par clé fonctionne, sans quitter cette session."
+    echo ""
+    if ask_yes_no "Tester la connexion par clé maintenant ?" "o"; then
+      tester_connexion_cle "$KEY_OWNER" "$KEY_PATH" "$user" "127.0.0.1" "$(ssh_listen_port)" || true
+    fi
+  fi
+
+  return 0
+}
+
+################################################################################
+# FONCTION : Durcissement de l'authentification SSH
+################################################################################
+# Active explicitement l'authentification par clé, puis propose de couper le
+# mot de passe — l'opération la plus risquée de cette étape, protégée par un
+# retour arrière automatique armé AVANT la modification.
+################################################################################
+durcir_authentification() {
+  local cible bin valeur delai choix rc=0
+
+  (( AUTHKEY_ADDED )) || return 0
+  if ! dpkg -s openssh-server >/dev/null 2>&1; then
+    return 0
+  fi
+
+  cible="$(sshd_target_file)"
+  bin="$(command -v sshd || echo /usr/sbin/sshd)"
+
+  backup_file_once /etc/ssh/sshd_config
+  [[ "$cible" != "/etc/ssh/sshd_config" ]] && backup_file_once "$cible"
+
+  # --- Authentification par clé : explicite, et sans risque ---------------------
+  set_sshd_directive "$cible" "PubkeyAuthentication" "yes"
+  if ! "$bin" -t 2>/dev/null; then
+    log_err "La configuration SSH devient invalide : restauration."
+    restore_file "$cible" "${cible}.bak.${RUN_STAMP}" || rm -f "$cible"
+    SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+    return 1
+  fi
+  ssh_reload_config || log_warn "Rechargement de sshd impossible."
+
+  valeur="$(sshd_effective pubkeyauthentication)"
+  if [[ "$valeur" == "yes" ]]; then
+    log_ok "Authentification par clé active (PubkeyAuthentication yes)."
+  else
+    log_warn "PubkeyAuthentication vaut « ${valeur:-inconnu} » après modification."
+  fi
+
+  # --- Coupure du mot de passe ---------------------------------------------------
+  echo ""
+  echo "------------------------------------------"
+  echo "  DÉSACTIVER L'AUTHENTIFICATION PAR MOT DE PASSE ?"
+  echo "------------------------------------------"
+  echo ""
+  echo "C'est le vrai gain de sécurité : tant que le mot de passe est accepté,"
+  echo "les robots continuent d'essayer, et un mot de passe faible reste une"
+  echo "porte ouverte malgré la clé."
+  echo ""
+  echo "C'est aussi l'opération la plus risquée de ce script : si la clé n'est"
+  echo "pas réellement exploitable, PLUS PERSONNE ne peut se connecter."
+  echo ""
+
+  if (( KEY_LOGIN_TESTED )); then
+    log_ok "Une connexion par clé a été testée avec succès pendant cette exécution."
+  else
+    log_warn "Aucune connexion par clé n'a pu être prouvée pendant cette exécution."
+    echo "  Sans preuve, cette désactivation est un pari."
+    echo ""
+    if ! ask_yes_no "Avez-vous DÉJÀ testé la connexion par clé depuis une autre session ?" "n"; then
+      echo ""
+      log_info "Mot de passe conservé. Testez « ssh -i <clé> $AUTHKEY_USER@<ip> » depuis"
+      echo "  votre poste, puis relancez ce script pour finir le durcissement."
+      return 0
+    fi
+  fi
+
+  echo ""
+  if ! ask_yes_no "Désactiver l'authentification par mot de passe ?" "n"; then
+    log_info "Authentification par mot de passe conservée."
+    return 0
+  fi
+
+  # --- Filet de sécurité armé AVANT la modification ------------------------------
+  echo ""
+  echo "Un retour automatique va être armé : sans confirmation de votre part,"
+  echo "le mot de passe sera réactivé tout seul."
+  echo ""
+  echo "  1. 5 minutes"
+  echo "  2. 10 minutes (recommandé)"
+  echo "  3. 15 minutes"
+  echo "  4. Aucun filet (déconseillé)"
+  echo ""
+  if ! read -r -p "Votre choix (1/2/3/4) [2] : " choix; then
+    choix="2"
+    echo ""
+  fi
+  case "${choix:-2}" in
+    1) delai=5 ;;
+    3) delai=15 ;;
+    4) delai=0 ;;
+    *) delai=10 ;;
+  esac
+  SSH_AUTH_ROLLBACK_DELAY="$delai"
+
+  if (( delai > 0 )); then
+    install_ssh_auth_tools "$cible" || log_warn "Installation des outils de retour arrière incomplète."
+    systemctl stop ssh-cles-rollback.timer >/dev/null 2>&1 || true
+    systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
+
+    if systemd-run --unit=ssh-cles-rollback \
+         --description="Réactivation du mot de passe SSH si le durcissement n'est pas confirmé" \
+         --on-active="${delai}min" \
+         /usr/local/sbin/ssh-cles-rollback >/dev/null 2>&1; then
+      SSH_AUTH_ROLLBACK_ARMED=1
+      log_ok "Retour automatique armé : mot de passe réactivé dans $delai minutes sans confirmation."
+    else
+      log_warn "Impossible d'armer le retour automatique."
+      echo ""
+      if ! ask_yes_no "Désactiver le mot de passe SANS filet de sécurité ?" "n"; then
+        log_info "Authentification par mot de passe conservée."
+        return 0
+      fi
+    fi
+  else
+    log_warn "Aucun filet de sécurité : gardez impérativement cette session ouverte."
+  fi
+
+  # --- Modification ---------------------------------------------------------------
+  set_sshd_directive "$cible" "PasswordAuthentication" "no"
+  # Sans cette seconde directive, Debian accepte encore le mot de passe par le
+  # canal « clavier-interactif » : la coupure serait illusoire.
+  set_sshd_directive "$cible" "KbdInteractiveAuthentication" "no"
+
+  if ! "$bin" -t 2>/dev/null; then
+    log_err "Configuration invalide : restauration immédiate."
+    restore_file "$cible" "${cible}.bak.${RUN_STAMP}" || rm -f "$cible"
+    ssh_reload_config || true
+    SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+    return 1
+  fi
+
+  if ! ssh_reload_config; then
+    log_warn "sshd n'a pas pu être rechargé : la modification n'est pas active."
+  fi
+
+  # --- Vérification de ce qui s'applique VRAIMENT --------------------------------
+  valeur="$(sshd_effective passwordauthentication)"
+  if [[ "$valeur" == "no" ]]; then
+    PASSWORD_AUTH_DISABLED=1
+    echo ""
+    log_ok "AUTHENTIFICATION PAR MOT DE PASSE DÉSACTIVÉE (vérifié via sshd -T)."
+    echo ""
+    echo "  ⚠ NE FERMEZ PAS CETTE SESSION avant d'avoir réussi une connexion"
+    echo "    par clé depuis un AUTRE terminal :"
+    echo ""
+    echo "      ssh -i <votre-clé> -p $(ssh_listen_port) $AUTHKEY_USER@$(adresse_affichable)"
+    echo ""
+    if (( SSH_AUTH_ROLLBACK_ARMED )); then
+      echo "  Une fois la connexion réussie, confirmez :"
+      echo ""
+      echo "      sudo ssh-cles-confirmer"
+      echo ""
+      echo "  Sans cette confirmation, le mot de passe sera réactivé dans"
+      echo "  $SSH_AUTH_ROLLBACK_DELAY minutes. Si vous n'arrivez pas à vous"
+      echo "  reconnecter : ne faites rien, attendez."
+      echo ""
+    else
+      echo "  Pour revenir en arrière : sudo ssh-cles-rollback"
+      echo "  (ou éditez $cible puis « systemctl reload ssh »)"
+      echo ""
+    fi
+  else
+    log_err "PasswordAuthentication vaut toujours « ${valeur:-inconnu} » : la coupure n'a PAS pris."
+    local sources
+    sources="$(sshd_directive_sources PasswordAuthentication)"
+    if [[ -n "$sources" ]]; then
+      echo "  sshd retient la PREMIÈRE valeur rencontrée, et ces fichiers la définissent :"
+      printf '%s\n' "$sources" | sed -e 's/^/    /'
+      echo "  Un fichier de /etc/ssh/sshd_config.d/ dont le numéro est INFÉRIEUR à"
+      echo "  99 (par exemple 50-cloud-init.conf) l'emporte sur celui du script."
+    fi
+    echo ""
+    log_info "L'état réel est donc inchangé : le mot de passe reste accepté."
+    # On réaligne notre fichier sur la réalité et on désarme le filet, qui
+    # n'aurait plus rien à restaurer.
+    set_sshd_directive "$cible" "PasswordAuthentication" "yes"
+    set_sshd_directive "$cible" "KbdInteractiveAuthentication" "yes"
+    ssh_reload_config || true
+    if (( SSH_AUTH_ROLLBACK_ARMED )); then
+      systemctl stop ssh-cles-rollback.timer >/dev/null 2>&1 || true
+      systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
+      SSH_AUTH_ROLLBACK_ARMED=0
+      log_info "Retour automatique désarmé (il n'y a rien à restaurer)."
+    fi
+    SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+    rc=1
+  fi
+
+  return $rc
+}
+
+################################################################################
 # POINT D'ARRÊT POUR LES TESTS
 ################################################################################
 # Toutes les fonctions sont définies. Si le fichier a été sourcé uniquement pour
@@ -1857,7 +3526,7 @@ echo ""
 
 while true; do
     echo "=========================================="
-    echo "  ÉTAPE 1/7 : COLORATION SYNTAXIQUE"
+    echo "  ÉTAPE 1/8 : COLORATION SYNTAXIQUE"
     echo "=========================================="
     echo ""
     echo "Souhaitez-vous activer la coloration syntaxique pour"
@@ -1911,7 +3580,7 @@ done
 # - Obtenir les dernières versions des paquets
 # - Éviter les bugs résolus dans les versions récentes
 ################################################################################
-banner "ÉTAPE 2/7 : MISE À JOUR DU SYSTÈME"
+banner "ÉTAPE 2/8 : MISE À JOUR DU SYSTÈME"
 echo "Cette étape va :"
 echo "  1. Mettre à jour la liste des paquets disponibles (apt update)"
 echo "  2. Installer les mises à jour de sécurité et correctifs (apt upgrade)"
@@ -1965,7 +3634,7 @@ command -v arping >/dev/null 2>&1 || install_pkgs iputils-arping >/dev/null 2>&1
 # Configure le clavier pour la disposition AZERTY française, ce qui est
 # essentiel pour une saisie confortable si vous utilisez un clavier français.
 ################################################################################
-banner "ÉTAPE 3/7 : CONFIGURATION DU CLAVIER"
+banner "ÉTAPE 3/8 : CONFIGURATION DU CLAVIER"
 echo "Configuration du clavier en disposition française (AZERTY)..."
 echo ""
 
@@ -2012,7 +3681,7 @@ fi
 # Le hostname est le nom de votre machine sur le réseau.
 # Il est affiché dans le prompt et utilisé pour identifier le serveur.
 ################################################################################
-banner "ÉTAPE 4/7 : CONFIGURATION DU HOSTNAME"
+banner "ÉTAPE 4/8 : CONFIGURATION DU HOSTNAME"
 echo "Le hostname est le nom d'identification de votre serveur."
 echo "Il apparaîtra dans le prompt de commande et sur le réseau."
 echo ""
@@ -2071,7 +3740,7 @@ fi
 # - Évite que l'IP change au redémarrage (contrairement au DHCP)
 # - Permet de configurer des règles firewall et DNS stables
 ################################################################################
-banner "ÉTAPE 5/7 : CONFIGURATION RÉSEAU"
+banner "ÉTAPE 5/8 : CONFIGURATION RÉSEAU"
 echo "Configuration d'une adresse IP fixe (statique)."
 echo ""
 echo "Une IP fixe est recommandée pour un serveur car :"
@@ -2318,7 +3987,7 @@ fi
 # - Permet de tracer qui fait quoi (logs sudo)
 # - Nécessaire si vous désactivez l'accès SSH root
 ################################################################################
-banner "ÉTAPE 6/7 : UTILISATEUR STANDARD"
+banner "ÉTAPE 6/8 : UTILISATEUR STANDARD"
 echo "Création d'un compte utilisateur standard avec privilèges sudo."
 echo ""
 echo "POURQUOI CRÉER UN UTILISATEUR STANDARD ?"
@@ -2428,7 +4097,7 @@ echo "Fin de l'étape utilisateur."
 # - Changement du port par défaut (22) pour éviter les scans automatiques
 # - Désactivation (ou configuration) de la connexion root
 ################################################################################
-banner "ÉTAPE 7/7 : SÉCURISATION SSH"
+banner "ÉTAPE 7/8 : SÉCURISATION SSH"
 echo "Configuration du service SSH pour l'accès à distance."
 echo ""
 
@@ -2625,6 +4294,94 @@ else
 fi
 
 ################################################################################
+# ÉTAPE 8 : AUTHENTIFICATION PAR CLÉ SSH
+################################################################################
+# Le mot de passe reste le maillon faible d'un accès SSH : il se devine, se
+# rejoue, et les robots le testent sans relâche sur le port exposé. Cette étape
+# met en place l'authentification par clé, dans un sens ou dans l'autre selon
+# le rôle de la machine :
+#
+#   - machine CLIENTE : génération d'une paire de clés (la privée reste ici) ;
+#   - SERVEUR         : dépôt d'une clé publique dans authorized_keys, puis
+#                       durcissement de sshd.
+#
+# Elle vient APRÈS l'étape 7 à dessein : le port SSH définitif est déjà connu et
+# vérifié, et l'utilisateur standard de l'étape 6 peut être proposé par défaut.
+################################################################################
+banner "ÉTAPE 8/8 : AUTHENTIFICATION PAR CLÉ SSH"
+echo "Se connecter avec une clé plutôt qu'avec un mot de passe."
+echo ""
+echo "Une paire de clés se compose de deux fichiers :"
+echo "  - la clé PRIVÉE, qui ne quitte jamais la machine cliente ;"
+echo "  - la clé PUBLIQUE, déposée sur les serveurs à atteindre."
+echo ""
+echo "Le rôle de CETTE machine détermine ce qu'il y a à faire ici."
+echo ""
+
+while true; do
+    echo "=========================================="
+    echo "  RÔLE DE CETTE MACHINE"
+    echo "=========================================="
+    echo ""
+    echo "  1. SERVEUR — elle REÇOIT des connexions SSH"
+    echo "     → déposer une clé publique dans authorized_keys"
+    echo "  2. CLIENT  — elle SE CONNECTE à d'autres machines"
+    echo "     → générer une paire de clés ici"
+    echo "  3. LES DEUX — poste rebond, serveur qui sauvegarde ailleurs..."
+    echo "     → générer une paire, puis déposer une clé publique"
+    echo "  4. Ignorer cette étape"
+    echo "  5. Explication (à quoi sert une clé, comment ça marche)"
+    echo ""
+    if ! read -r -p "Votre choix : " SSH_ROLE_CHOICE; then
+        SSH_ROLE_CHOICE="4"
+        echo ""
+    fi
+
+    case "$SSH_ROLE_CHOICE" in
+    1 | serveur | server | s)
+        SSH_ROLE="serveur"
+        installer_cle_publique || true
+        durcir_authentification || true
+        break
+        ;;
+    2 | client | c)
+        SSH_ROLE="client"
+        generer_paire_cles || true
+        break
+        ;;
+    3 | deux | les-deux | b)
+        SSH_ROLE="deux"
+        # L'ordre compte : la paire est générée d'abord, ce qui permet ensuite
+        # de proposer sa clé publique au dépôt local, puis de PROUVER que la
+        # connexion par clé fonctionne avant tout durcissement.
+        generer_paire_cles || true
+        echo ""
+        installer_cle_publique || true
+        durcir_authentification || true
+        break
+        ;;
+    4 | non | n | 0)
+        SSH_ROLE="aucun"
+        echo ""
+        log_info "Étape ignorée : la connexion SSH restera par mot de passe."
+        echo "  Vous pourrez relancer ce script plus tard pour la mettre en place."
+        echo ""
+        break
+        ;;
+    5 | explication | e)
+        afficher_explication_cles
+        read -r -p "Appuyez sur Entrée pour revenir au menu..." _ || true
+        clear
+        ;;
+    *)
+        echo ""
+        log_warn "Choix invalide. Entrez un nombre de 1 à 5."
+        echo ""
+        ;;
+    esac
+done
+
+################################################################################
 # RÉCAPITULATIF FINAL
 ################################################################################
 # Le récapitulatif s'appuie uniquement sur des drapeaux d'état réels : il
@@ -2680,6 +4437,47 @@ else
     echo "  - SSH : Non installé ou non configuré"
 fi
 
+# --- Authentification par clé ---------------------------------------------------
+if (( KEY_GENERATED )); then
+    echo "  ✓ Paire de clés créée pour $KEY_OWNER : $KEY_PATH"
+    if (( KEY_HAS_PASSPHRASE )); then
+        echo "    (protégée par une phrase de passe)"
+    else
+        echo "    ⚠ sans phrase de passe : le fichier suffit à ouvrir l'accès"
+    fi
+elif [[ "$SSH_ROLE" == "client" || "$SSH_ROLE" == "deux" ]]; then
+    echo "  ⚠ Paire de clés : demandée mais NON créée"
+fi
+
+if (( AUTHKEY_ADDED )); then
+    if (( AUTHKEY_COUNT > 0 )); then
+        echo "  ✓ Clé publique installée pour $AUTHKEY_USER ($AUTHKEY_COUNT ajoutée(s))"
+    else
+        echo "  ✓ Clé publique déjà en place pour $AUTHKEY_USER (aucun ajout nécessaire)"
+    fi
+    if (( KEY_LOGIN_TESTED )); then
+        echo "    (connexion par clé testée avec succès)"
+    else
+        echo "    ⚠ connexion par clé non testée : vérifiez-la AVANT de fermer cette session"
+    fi
+elif [[ "$SSH_ROLE" == "serveur" || "$SSH_ROLE" == "deux" ]]; then
+    echo "  ⚠ Clé publique : aucune n'a été installée"
+fi
+
+if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
+    EFFECTIVE_PASSWORD="$(sshd_effective passwordauthentication)"
+    case "${EFFECTIVE_PASSWORD:-}" in
+        no)
+            echo "  ✓ Mot de passe SSH : DÉSACTIVÉ (connexion par clé uniquement)"
+            if (( SSH_AUTH_ROLLBACK_ARMED )); then
+                echo "    ⚠ À CONFIRMER sous $SSH_AUTH_ROLLBACK_DELAY min : sudo ssh-cles-confirmer"
+            fi
+            ;;
+        yes) echo "  - Mot de passe SSH : toujours accepté" ;;
+        *)   : ;;
+    esac
+fi
+
 if (( SCRIPT_ERRORS > 0 )); then
   echo ""
   log_warn "$SCRIPT_ERRORS erreur(s) ont été rencontrée(s) pendant l'exécution (voir plus haut)."
@@ -2711,8 +4509,42 @@ if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
 fi
 if (( USER_CREATED )); then
   echo "$VERIF_N. Tester l'accès  : ssh -p ${SSH_PORT:-22} $STANDARD_USER@${STATIC_IP_BARE:-<IP>}"
+  VERIF_N=$((VERIF_N + 1))
+fi
+if (( AUTHKEY_ADDED )); then
+  echo "$VERIF_N. Tester la CLÉ   : ssh -i <votre-clé-privée> -p ${SSH_PORT:-22} $AUTHKEY_USER@$(adresse_affichable)"
+  echo "   (depuis le poste qui détient la clé privée)"
+  VERIF_N=$((VERIF_N + 1))
+fi
+if (( KEY_GENERATED )); then
+  echo "$VERIF_N. Clé publique à diffuser : cat $KEY_PUB_PATH"
+  VERIF_N=$((VERIF_N + 1))
 fi
 echo ""
+
+# Le durcissement SSH prime sur tout le reste : sans confirmation dans le délai
+# imparti, le mot de passe est réactivé. C'est donc la première chose à faire
+# après reconnexion, avant même la confirmation de l'IP fixe.
+if (( SSH_AUTH_ROLLBACK_ARMED )) && (( PASSWORD_AUTH_DISABLED )); then
+  echo "=========================================================="
+  echo "  ⚠ À FAIRE EN PRIORITÉ — DURCISSEMENT SSH NON CONFIRMÉ"
+  echo "=========================================================="
+  echo ""
+  echo "  Le mot de passe SSH est désactivé, mais un retour automatique est"
+  echo "  armé : sans confirmation dans les $SSH_AUTH_ROLLBACK_DELAY minutes,"
+  echo "  il sera réactivé tout seul."
+  echo ""
+  echo "    1. Reconnectez-vous avec votre clé, depuis un AUTRE terminal :"
+  echo "         ssh -i <votre-clé-privée> -p ${SSH_PORT:-22} $AUTHKEY_USER@$(adresse_affichable)"
+  echo "    2. Confirmez :"
+  echo "         sudo ssh-cles-confirmer"
+  echo ""
+  echo "  Si la connexion par clé échoue : ne faites rien, attendez. Le mot de"
+  echo "  passe redeviendra utilisable tout seul."
+  echo ""
+  echo "=========================================================="
+  echo ""
+fi
 echo "=========================================="
 echo ""
 
