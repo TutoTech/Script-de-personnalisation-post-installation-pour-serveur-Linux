@@ -3644,10 +3644,15 @@ echo "Configuration du clavier en disposition française (AZERTY)..."
 echo ""
 
 KEYBOARD_OK=1
-run_cmd "Installation des paquets nécessaires..." install_pkgs console-setup keyboard-configuration || KEYBOARD_OK=0
+run_cmd "Installation des paquets nécessaires..." install_pkgs console-setup keyboard-configuration kbd || KEYBOARD_OK=0
 
 if (( KEYBOARD_OK )); then
-  run_cmd "Chargement immédiat de la disposition française..." loadkeys fr || true
+  log_info "Chargement immédiat de la disposition française..."
+  if loadkeys fr 2>/dev/null || loadkeys fr-pc 2>/dev/null || loadkeys fr-latin1 2>/dev/null || localectl set-keymap fr 2>/dev/null; then
+    log_ok "Disposition française appliquée immédiatement à la console."
+  else
+    log_info "Chargement immédiat en console ignoré (sans console TTY physique ou via SSH)."
+  fi
 
   if [ -f /etc/default/keyboard ]; then
     backup_file /etc/default/keyboard
