@@ -260,6 +260,7 @@ banner() {
     CURRENT_STEP_COLOR="$color"
   fi
 
+  # shellcheck disable=SC2001
   local clean_title
   clean_title="$(echo "$title" | sed 's/\x1b\[[0-9;]*m//g')"
   local len=${#clean_title}
