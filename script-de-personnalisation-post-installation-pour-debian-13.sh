@@ -183,23 +183,104 @@ NET_TEST_DOMAINS=("example.org" "debian.org" "cloudflare.com")
 ################################################################################
 
 ################################################################################
-# FONCTION : Affichage
+# FONCTION : Affichage & Système de Couleurs par Étape
 ################################################################################
-# Uniformise la présentation. Les messages d'erreur et d'avertissement partent
-# sur la sortie d'erreur (stderr) afin de rester visibles même si la sortie
-# standard est redirigée dans un fichier de log.
+# Uniformise la présentation. Chaque étape possède sa propre couleur thématique
+# pour permettre à l'utilisateur d'identifier instantanément l'avancement.
 ################################################################################
+if [ -t 1 ] || [ -n "${FORCE_COLOR:-}" ]; then
+  C_RESET="\e[0m"
+  C_BOLD="\e[1m"
+  C_DIM="\e[2m"
+
+  # Couleurs statutaires
+  C_OK="\e[1;32m"        # Vert brillant
+  C_INFO="\e[1;36m"      # Cyan brillant
+  C_WARN="\e[1;33m"      # Jaune / Ambre
+  C_ERR="\e[1;31m"       # Rouge brillant
+
+  # Couleurs distinctes par étape (8 étapes + Intro + Bilan)
+  COLOR_INTRO="\e[1;38;5;39m"    # Bleu Roi / Cyan Vif
+  COLOR_STEP1="\e[1;38;5;51m"    # Cyan Fluo / Turquoise (Étape 1 : Coloration)
+  COLOR_STEP2="\e[1;38;5;75m"    # Bleu Ciel / Steel Blue (Étape 2 : Mises à jour)
+  COLOR_STEP3="\e[1;38;5;82m"    # Vert Émeraude (Étape 3 : Clavier)
+  COLOR_STEP4="\e[1;38;5;214m"   # Jaune Ambre / Gold (Étape 4 : Hostname)
+  COLOR_STEP5="\e[1;38;5;171m"   # Violet / Magenta Vif (Étape 5 : Réseau IP)
+  COLOR_STEP6="\e[1;38;5;45m"    # Bleu Lagon / Teal (Étape 6 : Utilisateur)
+  COLOR_STEP7="\e[1;38;5;208m"   # Orange Brillant (Étape 7 : Sécurisation SSH)
+  COLOR_STEP8="\e[1;38;5;141m"   # Mauve / Violet Pastel (Étape 8 : Clés SSH)
+  COLOR_SUMMARY="\e[1;38;5;220m" # Or / Jaune Soleil (Récapitulatif & Bilan)
+else
+  C_RESET=""
+  C_BOLD=""
+  C_DIM=""
+  C_OK=""
+  C_INFO=""
+  C_WARN=""
+  C_ERR=""
+  COLOR_INTRO=""
+  COLOR_STEP1=""
+  COLOR_STEP2=""
+  COLOR_STEP3=""
+  COLOR_STEP4=""
+  COLOR_STEP5=""
+  COLOR_STEP6=""
+  COLOR_STEP7=""
+  COLOR_STEP8=""
+  COLOR_SUMMARY=""
+fi
+
+CURRENT_STEP_COLOR="${COLOR_INTRO}"
+
 log()       { printf '%s\n' "$*"; }
-log_info()  { printf '→ %s\n' "$*"; }
-log_ok()    { printf '✓ %s\n' "$*"; }
-log_warn()  { printf '⚠ %s\n' "$*" >&2; }
-log_err()   { printf '❌ %s\n' "$*" >&2; }
+log_info()  { printf "${C_INFO}→${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$*"; }
+log_ok()    { printf "${C_OK}✓${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$*"; }
+log_warn()  { printf "${C_WARN}⚠ %s${C_RESET}\n" "$*" >&2; }
+log_err()   { printf "${C_ERR}❌ %s${C_RESET}\n" "$*" >&2; }
 
 banner() {
+  local title="$*"
+  local color="${CURRENT_STEP_COLOR}"
+
+  if [[ "$title" =~ ÉTAPE[[:space:]]+([1-8])/8 ]]; then
+    local num="${BASH_REMATCH[1]}"
+    case "$num" in
+      1) color="${COLOR_STEP1}" ;;
+      2) color="${COLOR_STEP2}" ;;
+      3) color="${COLOR_STEP3}" ;;
+      4) color="${COLOR_STEP4}" ;;
+      5) color="${COLOR_STEP5}" ;;
+      6) color="${COLOR_STEP6}" ;;
+      7) color="${COLOR_STEP7}" ;;
+      8) color="${COLOR_STEP8}" ;;
+    esac
+    CURRENT_STEP_COLOR="$color"
+  elif [[ "$title" == *"TERMINÉE"* || "$title" == *"BILAN"* || "$title" == *"COMMANDES DE VÉRIFICATION"* ]]; then
+    color="${COLOR_SUMMARY}"
+    CURRENT_STEP_COLOR="$color"
+  fi
+
+  local clean_title
+  clean_title="$(echo "$title" | sed 's/\x1b\[[0-9;]*m//g')"
+  local len=${#clean_title}
+  local width=$((len + 6))
+  (( width < 50 )) && width=50
+
+  local line=""
+  for ((i=0; i<width-2; i++)); do line="${line}─"; done
+
+  local padding_total=$((width - 2 - len))
+  local pad_left=$((padding_total / 2))
+  local pad_right=$((padding_total - pad_left))
+
+  local spaces_left="" spaces_right=""
+  for ((i=0; i<pad_left; i++)); do spaces_left="${spaces_left} "; done
+  for ((i=0; i<pad_right; i++)); do spaces_right="${spaces_right} "; done
+
   echo ""
-  echo "=========================================="
-  echo "  $*"
-  echo "=========================================="
+  echo -e "${color}╭${line}╮${C_RESET}"
+  echo -e "${color}│${spaces_left}${C_BOLD}${title}${C_RESET}${color}${spaces_right}│${C_RESET}"
+  echo -e "${color}╰${line}╯${C_RESET}"
   echo ""
 }
 
@@ -263,16 +344,18 @@ run_cmd() {
 ask_yes_no() {
   local question="${1:-Confirmez-vous ?}"
   local default="${2:-}"
-  local hint reply
+  local hint reply prompt_str
 
   case "${default,,}" in
-    y|yes|o|oui|1) hint="[O/n]" ;;
-    n|no|non|0)    hint="[o/N]" ;;
-    *)             hint="[o/n]" ;;
+    y|yes|o|oui|1) hint="${C_BOLD}[O/n]${C_RESET}" ;;
+    n|no|non|0)    hint="${C_BOLD}[o/N]${C_RESET}" ;;
+    *)             hint="${C_BOLD}[o/n]${C_RESET}" ;;
   esac
 
+  prompt_str="$(echo -e "${CURRENT_STEP_COLOR}?${C_RESET} ${question} ${hint} : ")"
+
   while true; do
-    if ! read -r -p "$question $hint : " reply; then
+    if ! read -r -p "$prompt_str" reply; then
       echo "" >&2
       log_warn "Entrée standard indisponible : réponse « ${default:-non} » utilisée."
       reply="${default:-non}"
@@ -308,9 +391,9 @@ ask_input() {
 
   while true; do
     if [[ -n "$default" ]]; then
-      shown="$prompt [$default] : "
+      shown="$(echo -e "${CURRENT_STEP_COLOR}?${C_RESET} ${prompt} ${C_DIM}[${default}]${C_RESET} : ")"
     else
-      shown="$prompt : "
+      shown="$(echo -e "${CURRENT_STEP_COLOR}?${C_RESET} ${prompt} : ")"
     fi
 
     if ! read -r -p "$shown" value; then
@@ -3522,18 +3605,10 @@ detect_os
 ################################################################################
 # ÉTAPE 1 : CONFIGURATION DE LA COLORATION SYNTAXIQUE
 ################################################################################
-echo ""
-echo "╔════════════════════════════════════════╗"
-echo "║   CONFIGURATION SERVEUR DEBIAN 13      ║"
-echo "║            (Trixie)                    ║"
-echo "╚════════════════════════════════════════╝"
-echo ""
+banner "CONFIGURATION SERVEUR DEBIAN 13 (Trixie)"
 
 while true; do
-    echo "=========================================="
-    echo "  ÉTAPE 1/8 : COLORATION SYNTAXIQUE"
-    echo "=========================================="
-    echo ""
+    banner "ÉTAPE 1/8 : COLORATION SYNTAXIQUE"
     echo "Souhaitez-vous activer la coloration syntaxique pour"
     echo "l'utilisateur root dans la console ?"
     echo ""
@@ -3541,11 +3616,11 @@ while true; do
     echo "des couleurs au prompt et aux commandes."
     echo ""
     echo "Choix disponibles :"
-    echo "  1. oui         - Activer la coloration"
-    echo "  2. non         - Continuer sans coloration"
-    echo "  3. explication - Afficher plus de détails"
+    echo -e "  ${C_BOLD}1. oui${C_RESET}         - Activer la coloration"
+    echo -e "  ${C_BOLD}2. non${C_RESET}         - Continuer sans coloration"
+    echo -e "  ${C_BOLD}3. explication${C_RESET} - Afficher plus de détails"
     echo ""
-    if ! read -r -p "Votre choix : " choix; then
+    if ! read -r -p "$(echo -e "${CURRENT_STEP_COLOR}?${C_RESET} Votre choix : ")" choix; then
         choix="2"
         echo ""
     fi
@@ -4329,20 +4404,18 @@ echo "Le rôle de CETTE machine détermine ce qu'il y a à faire ici."
 echo ""
 
 while true; do
-    echo "=========================================="
-    echo "  RÔLE DE CETTE MACHINE"
-    echo "=========================================="
+    echo -e "${CURRENT_STEP_COLOR}━━━ RÔLE DE CETTE MACHINE ━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
     echo ""
-    echo "  1. SERVEUR — elle REÇOIT des connexions SSH"
+    echo -e "  ${C_BOLD}1. SERVEUR${C_RESET}  — elle REÇOIT des connexions SSH"
     echo "     → déposer une clé publique dans authorized_keys"
-    echo "  2. CLIENT  — elle SE CONNECTE à d'autres machines"
+    echo -e "  ${C_BOLD}2. CLIENT${C_RESET}   — elle SE CONNECTE à d'autres machines"
     echo "     → générer une paire de clés ici"
-    echo "  3. LES DEUX — poste rebond, serveur qui sauvegarde ailleurs..."
+    echo -e "  ${C_BOLD}3. LES DEUX${C_RESET} — poste rebond, serveur qui sauvegarde ailleurs..."
     echo "     → générer une paire, puis déposer une clé publique"
-    echo "  4. Ignorer cette étape"
-    echo "  5. Explication (à quoi sert une clé, comment ça marche)"
+    echo -e "  ${C_BOLD}4. Ignorer cette étape${C_RESET}"
+    echo -e "  ${C_BOLD}5. Explication${C_RESET} (à quoi sert une clé, comment ça marche)"
     echo ""
-    if ! read -r -p "Votre choix : " SSH_ROLE_CHOICE; then
+    if ! read -r -p "$(echo -e "${CURRENT_STEP_COLOR}?${C_RESET} Votre choix : ")" SSH_ROLE_CHOICE; then
         SSH_ROLE_CHOICE="4"
         echo ""
     fi
