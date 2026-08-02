@@ -238,6 +238,7 @@ log_ok()    { printf "${C_OK}✓${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$*"; }
 log_warn()  { printf "${C_WARN}⚠ %s${C_RESET}\n" "$*" >&2; }
 log_err()   { printf "${C_ERR}❌ %s${C_RESET}\n" "$*" >&2; }
 
+# shellcheck disable=SC2001
 banner() {
   local title="$*"
   local color="${CURRENT_STEP_COLOR}"
