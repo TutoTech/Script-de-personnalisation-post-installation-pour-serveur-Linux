@@ -260,9 +260,8 @@ banner() {
     CURRENT_STEP_COLOR="$color"
   fi
 
-  # shellcheck disable=SC2001
   local clean_title
-  clean_title="$(echo "$title" | sed 's/\x1b\[[0-9;]*m//g')"
+  clean_title="$(sed 's/\x1b\[[0-9;]*m//g' <<< "$title")"
   local len=${#clean_title}
   local width=$((len + 6))
   (( width < 50 )) && width=50
