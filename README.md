@@ -106,23 +106,30 @@ Le script détecte donc la situation réelle et configure le DNS là où il sera
 ### 📋 Prérequis
 
 * Un serveur tournant sous **Debian 13**.
-* Les privilèges **root** ou **sudo**.
+* Un accès **`root`**. Sur Debian 13, `sudo` n'est **pas installé par défaut** (paquet de priorité *optional*) : ouvrez une session `root`, ou basculez avec `su -`. Le script installe lui-même `sudo` à l'étape 6, au moment de créer l'utilisateur standard.
+* La commande **`curl`**, nécessaire pour l'installation rapide ci-dessous. Elle non plus n'est **pas installée par défaut** sur Debian 13 : la commande fournie plus bas s'en charge automatiquement, sinon installez-la à la main avec `apt install curl`. (À l'intérieur du script, `wget` est accepté en remplacement pour récupérer une clé publique depuis une URL.)
 * Un accès console (physique, IPMI ou VNC) reste conseillé par prudence, mais n'est plus indispensable : les garde-fous décrits ci-dessus sont conçus pour permettre un usage entièrement à distance.
 
 ### 🚀 Utilisation
 
-Pour lancer la configuration, exécutez simplement la commande suivante directement dans le terminal de votre Debian (accès à Internet requis) :
+> ⚠️ **À exécuter en tant que `root`, sans `sudo`** : `sudo` n'est pas installé par défaut sur Debian 13. Ouvrez une session `root`, ou basculez avec `su -`.
+
+Pour lancer la configuration, exécutez simplement la commande suivante directement dans le terminal de votre Debian (accès à Internet requis). Elle installe `curl` s'il est absent, télécharge le script, l'exécute, puis supprime le fichier temporaire :
 
 ```bash
-sudo -E bash -c 'f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f" ; rm -f "$f"'
+bash -c 'command -v curl >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl; }; command -v curl >/dev/null 2>&1 || { echo "curl est introuvable : installez-le avec « apt install curl » puis relancez cette commande."; exit 1; }; f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f" ; rm -f "$f"'
 ```
-ou plus classiquement : 
+
+Si `curl` manque **et** que son installation échoue (pas de réseau, dépôts injoignables), la commande s'arrête sur un message explicite au lieu d'une erreur obscure.
+
+ou plus classiquement, une fois le script récupéré sur la machine :
 
 ```bash
 chmod +x script-de-personnalisation-post-installation-pour-debian-13.sh
-sudo ./script-de-personnalisation-post-installation-pour-debian-13.sh
-
+./script-de-personnalisation-post-installation-pour-debian-13.sh
 ```
+
+Depuis un compte disposant déjà de `sudo`, préfixez la commande : `sudo ./script-de-personnalisation-post-installation-pour-debian-13.sh`.
 
 ### 🧪 Développement
 
@@ -227,24 +234,30 @@ The script therefore detects the actual setup and configures DNS where it will r
 ### 📋 Prerequisites
 
 * A server running **Debian 13**.
-* **Root** or **sudo** privileges.
+* **`root`** access. On Debian 13, `sudo` is **not installed by default** (it is an *optional* priority package): log in as `root`, or switch with `su -`. The script installs `sudo` itself in step 6, when it creates the standard user.
+* The **`curl`** command, required by the quick install below. It is **not installed by default** on Debian 13 either: the command below takes care of it, otherwise install it by hand with `apt install curl`. (Inside the script, `wget` is accepted as a substitute when fetching a public key from a URL.)
 * Console access (physical, IPMI or VNC) is still recommended as a precaution, but is no longer required: the safeguards above are designed for fully remote use.
 
 ### 🚀 Usage
 
-To start the configuration, simply run:
+> ⚠️ **Run this as `root`, without `sudo`**: `sudo` is not installed by default on Debian 13. Log in as `root`, or switch with `su -`.
+
+To start the configuration, simply run the following command (Internet access required). It installs `curl` when missing, downloads the script, runs it, then removes the temporary file:
 
 ```bash
-sudo -E bash -c 'f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f" ; rm -f "$f"'
+bash -c 'command -v curl >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl; }; command -v curl >/dev/null 2>&1 || { echo "curl not found: install it with: apt install curl - then run this command again."; exit 1; }; f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f" ; rm -f "$f"'
 ```
 
-or : 
+If `curl` is missing **and** cannot be installed (no network, unreachable repositories), the command stops with an explicit message instead of an obscure error.
+
+or, once the script is already on the machine:
 
 ```bash
 chmod +x script-de-personnalisation-post-installation-pour-debian-13.sh
-sudo ./script-de-personnalisation-post-installation-pour-debian-13.sh
-
+./script-de-personnalisation-post-installation-pour-debian-13.sh
 ```
+
+From an account that already has `sudo`, prefix it: `sudo ./script-de-personnalisation-post-installation-pour-debian-13.sh`.
 
 ### 🧪 Development
 
