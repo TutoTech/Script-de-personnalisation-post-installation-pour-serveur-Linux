@@ -117,7 +117,7 @@ Le script détecte donc la situation réelle et configure le DNS là où il sera
 Pour lancer la configuration, exécutez simplement la commande suivante directement dans le terminal de votre Debian (accès à Internet requis). Elle installe `curl` s'il est absent, télécharge le script, l'exécute, puis supprime le fichier temporaire :
 
 ```bash
-bash -c 'command -v curl >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl; }; command -v curl >/dev/null 2>&1 || { echo "curl est introuvable : installez-le avec « apt install curl » puis relancez cette commande."; exit 1; }; f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f" ; rm -f "$f"'
+bash -c 'command -v curl >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl; }; command -v curl >/dev/null 2>&1 || { echo "curl est introuvable : installez-le avec « apt install curl » puis relancez cette commande."; exit 1; }; f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f"; rc=$?; rm -f "$f"; exit $rc'
 ```
 
 Si `curl` manque **et** que son installation échoue (pas de réseau, dépôts injoignables), la commande s'arrête sur un message explicite au lieu d'une erreur obscure.
@@ -245,7 +245,7 @@ The script therefore detects the actual setup and configures DNS where it will r
 To start the configuration, simply run the following command (Internet access required). It installs `curl` when missing, downloads the script, runs it, then removes the temporary file:
 
 ```bash
-bash -c 'command -v curl >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl; }; command -v curl >/dev/null 2>&1 || { echo "curl not found: install it with: apt install curl - then run this command again."; exit 1; }; f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f" ; rm -f "$f"'
+bash -c 'command -v curl >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl; }; command -v curl >/dev/null 2>&1 || { echo "curl not found: install it with: apt install curl - then run this command again."; exit 1; }; f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f"; rc=$?; rm -f "$f"; exit $rc'
 ```
 
 If `curl` is missing **and** cannot be installed (no network, unreachable repositories), the command stops with an explicit message instead of an obscure error.
