@@ -3552,10 +3552,12 @@ fi
 
 if "$SSHD_BIN" -T 2>/dev/null | grep -qi '^passwordauthentication yes'; then
   journal "Le mot de passe est de nouveau accepté."
-else
-  journal "ATTENTION : le mot de passe n'a PAS pu être réactivé. Un accès console est nécessaire."
+  exit 0
 fi
-exit 0
+# Code de retour non nul : le script (reactiver_mot_de_passe_si_orphelin) comme
+# l'administrateur savent ainsi que le filet n'a PAS joué.
+journal "ATTENTION : le mot de passe n'a PAS pu être réactivé. Un accès console est nécessaire."
+exit 1
 ROLLBACK
 
   installer_fichier /usr/local/sbin/ssh-cles-confirmer 755 bash <<'CONFIRM' || return 1
@@ -4550,7 +4552,7 @@ installer_cle_publique() {
 # retour arrière automatique armé AVANT la modification.
 ################################################################################
 durcir_authentification() {
-  local cible bin valeur delai choix rc=0 outils_ok=1
+  local cible bin valeur kbd delai choix rc=0 outils_ok=1
 
   (( AUTHKEY_ADDED )) || return 0
   if ! dpkg -s openssh-server >/dev/null 2>&1; then
@@ -4775,8 +4777,12 @@ durcir_authentification() {
   fi
 
   # --- Vérification de ce qui s'applique VRAIMENT --------------------------------
+  # Les DEUX directives doivent valoir « no » : avec KbdInteractiveAuthentication
+  # encore à « yes » (un fichier lu avant le nôtre), sshd accepterait toujours un
+  # mot de passe par le canal clavier-interactif.
   valeur="$(sshd_effective passwordauthentication)"
-  if [[ "$valeur" == "no" ]]; then
+  kbd="$(sshd_effective kbdinteractiveauthentication)"
+  if [[ "$valeur" == "no" && "$kbd" == "no" ]]; then
     PASSWORD_AUTH_DISABLED=1
     echo ""
     log_ok "AUTHENTIFICATION PAR MOT DE PASSE DÉSACTIVÉE (vérifié via sshd -T)."
@@ -4805,9 +4811,14 @@ durcir_authentification() {
       echo ""
     fi
   else
-    log_err "PasswordAuthentication vaut toujours « ${valeur:-inconnu} » : la coupure n'a PAS pris."
-    local sources
-    sources="$(sshd_directive_sources PasswordAuthentication)"
+    local directive="PasswordAuthentication" sources
+    if [[ "$valeur" == "no" ]]; then
+      directive="KbdInteractiveAuthentication"
+      log_err "KbdInteractiveAuthentication vaut toujours « ${kbd:-inconnu} » : le mot de passe reste accepté par le canal clavier-interactif, la coupure n'a PAS pris."
+    else
+      log_err "PasswordAuthentication vaut toujours « ${valeur:-inconnu} » : la coupure n'a PAS pris."
+    fi
+    sources="$(sshd_directive_sources "$directive")"
     if [[ -n "$sources" ]]; then
       echo "  sshd retient la PREMIÈRE valeur rencontrée, et ces fichiers la définissent :"
       printf '%s\n' "$sources" | sed -e 's/^/    /'
@@ -4847,6 +4858,32 @@ fi
 ################################################################################
 # INITIALISATION
 ################################################################################
+# Une seule exécution à la fois : l'état de bascule, les outils, les drapeaux de
+# confirmation et les unités systemd sont uniques sur la machine. Deux exécutions
+# simultanées écraseraient l'état l'une de l'autre, et un garde-fou pourrait
+# restaurer la configuration de l'autre. Le verrou (flock sur un descripteur)
+# est libéré à la fin du processus, quelle qu'en soit l'issue.
+LOCK_FILE="/run/lock/personnalisation-debian13.lock"
+if [[ ! -d /run/lock || ! -w /run/lock ]]; then
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  LOCK_FILE="$STATE_DIR/verrou"
+fi
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    echo "=========================================="
+    echo "  ERREUR : EXÉCUTION DÉJÀ EN COURS"
+    echo "=========================================="
+    echo ""
+    echo "Une autre exécution de ce script tient le verrou $LOCK_FILE."
+    echo "Attendez qu'elle se termine (ou vérifiez avec « ps aux | grep $(basename "$0") »)."
+    echo ""
+    exit 1
+  fi
+else
+  echo "Avertissement : « flock » introuvable, l'exclusion entre deux exécutions simultanées n'est pas assurée." >&2
+fi
+
 detect_os
 
 ################################################################################

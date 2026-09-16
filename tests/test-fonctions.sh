@@ -883,8 +883,9 @@ for c in systemctl logger; do
   chmod 755 "$TMP_SR/bin/$c"
 done
 # shellcheck disable=SC2016
-printf '#!/bin/bash\ncase "$1" in\n  -t) [ ! -e "%s/sshd-invalide" ] ;;\n  -T) echo "passwordauthentication yes" ;;\n  *) exit 0 ;;\nesac\n' "$TMP_SR" > "$TMP_SR/bin/sshd"
+printf '#!/bin/bash\ncase "$1" in\n  -t) [ ! -e "%s/sshd-invalide" ] ;;\n  -T) cat "%s/sshd-T" ;;\n  *) exit 0 ;;\nesac\n' "$TMP_SR" "$TMP_SR" > "$TMP_SR/bin/sshd"
 chmod 755 "$TMP_SR/bin/sshd"
+printf 'passwordauthentication yes\n' > "$TMP_SR/sshd-T"
 awk "/ssh-cles-rollback 755 bash <<'ROLLBACK'/ { on = 1; next } /^ROLLBACK\$/ { on = 0 } on" "$CIBLE" |
   sed -e "s|^STATE_FILE=.*|STATE_FILE=\"$TMP_SR/etat/ssh-auth.env\"|" > "$TMP_SR/ssh-cles-rollback"
 ok "ssh-cles-rollback extrait et analysable"   bash -n "$TMP_SR/ssh-cles-rollback"
@@ -912,6 +913,11 @@ rm -f "$REF_SR" "$CIBLE_SR"
 : > "$REF_SR.absent"
 ok   "marqueur d'absence : succès"                            rollback_ssh
 ko   "marqueur d'absence : fichier créé par le durcissement supprimé" test -e "$CIBLE_SR"
+# Le mot de passe reste refusé d'après « sshd -T » : le filet n'a pas joué, l'outil
+# le dit par son code de retour (lu par reactiver_mot_de_passe_si_orphelin).
+rm -f "$TMP_SR/sshd-invalide"
+printf 'passwordauthentication no\n' > "$TMP_SR/sshd-T"
+ko   "mot de passe toujours refusé : échec propagé"           rollback_ssh
 rm -rf "$TMP_SR"
 rm -rf "$TMP_COMMON" "$TMP_BIN"
 
