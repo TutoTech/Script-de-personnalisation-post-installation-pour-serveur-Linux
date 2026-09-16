@@ -18,8 +18,8 @@ Le script traite les huit étapes essentielles de la mise en service d'un serveu
 3. **Localisation** : Configuration du clavier en français (**AZERTY**).
 4. **Identité** : Personnalisation du nom d'hôte (hostname), avec validation du format.
 5. **Réseau statique** : Configuration d'une IP fixe **dans le gestionnaire réseau déjà en place**, avec vérification préalable et retour automatique au DHCP en cas de problème.
-6. **Sécurité Utilisateur** : Création d'un utilisateur standard avec privilèges `sudo` pour éviter l'usage de root.
-7. **Durcissement SSH** : Changement du port d'écoute (compatible avec l'activation par socket de Debian 13) et configuration de l'accès root.
+6. **Sécurité Utilisateur** : Création d'un utilisateur standard et ajout au groupe `sudo`, pour éviter l'usage de root. L'ajout est vérifié : le récapitulatif final signale un compte créé sans `sudo` si cet ajout a échoué.
+7. **Durcissement SSH** : Changement du port d'écoute et configuration de l'accès root. Si SSH est démarré par `ssh.socket` (activation par socket, optionnelle sur Debian), la directive `Port` est ignorée par le système : le script le détecte et écrit alors la surcharge de la socket.
 8. **Authentification par clé** : Génération d'une paire de clés si la machine est un **client**, dépôt d'une clé publique dans `authorized_keys` si c'est un **serveur**, puis durcissement facultatif avec retour automatique en cas de problème.
 
 ### 🔑 Authentification par clé SSH
@@ -58,7 +58,7 @@ Le script vérifie ensuite ce qui empêche réellement une clé de fonctionner :
 
 `PubkeyAuthentication yes` est posé systématiquement. La désactivation du mot de passe (`PasswordAuthentication no` **et** `KbdInteractiveAuthentication no`, sans quoi la coupure serait illusoire sur Debian) n'est proposée qu'après une connexion par clé prouvée ou une confirmation explicite, et le résultat est vérifié via `sshd -T` — si un fichier de `/etc/ssh/sshd_config.d/` numéroté avant le nôtre l'emporte, le script le nomme au lieu d'annoncer un succès qui n'a pas eu lieu.
 
-Comme pour le changement d'IP, un **retour automatique est armé avant la modification** : sans confirmation dans le délai choisi, le mot de passe est réactivé tout seul.
+Comme pour le changement d'IP, un **retour automatique est armé avant la modification** : sans confirmation dans le délai choisi, le mot de passe est réactivé tout seul. Cette minuterie est transitoire (`systemd-run`) : elle ne survit pas à un redémarrage, contrairement à la commande `ssh-cles-rollback`, toujours disponible.
 
 | Commande | Rôle |
 |---|---|
@@ -76,6 +76,8 @@ Le passage en IP fixe est l'opération la plus risquée d'un post-installation :
 | **Test à chaud non destructif** : l'adresse est ajoutée en **secondaire** (l'adresse DHCP reste active), puis on teste la passerelle, la résolution DNS et le ping de `example.org`, `debian.org` et `cloudflare.com` | La session SSH n'est **jamais** coupée pendant la vérification, et rien n'est écrit tant que les tests échouent |
 | **Bascule en toute fin de script**, exécutée de façon détachée via `systemd-run` | La coupure SSH ne peut plus interrompre l'opération à mi-chemin |
 | **Retour automatique au DHCP** : une minuterie systemd restaure la configuration précédente sans confirmation de votre part, et un service de démarrage fait de même si le serveur ne répond pas après un redémarrage | Un serveur injoignable nécessitant un déplacement physique ou une console IPMI |
+
+Le garde-fou de démarrage et les commandes de retour arrière sont installés **avant la première écriture de fichier** (étape 5), et non au seul moment de la bascule : un redémarrage ou une interruption du script avant la fin reste couvert. Si ces outils ne peuvent pas être installés, rien n'est écrit ; si une écriture échoue en cours de route, les fichiers déjà modifiés sont restaurés. Avec NetworkManager, le fichier du profil est sauvegardé avant modification et restauré à l'identique en cas de retour arrière.
 
 Après la bascule, reconnectez-vous sur la nouvelle adresse et validez :
 
@@ -114,10 +116,10 @@ Le script détecte donc la situation réelle et configure le DNS là où il sera
 
 > ⚠️ **À exécuter en tant que `root`, sans `sudo`** : `sudo` n'est pas installé par défaut sur Debian 13. Ouvrez une session `root`, ou basculez avec `su -`.
 
-Pour lancer la configuration, exécutez simplement la commande suivante directement dans le terminal de votre Debian (accès à Internet requis). Elle installe `curl` s'il est absent, télécharge le script, l'exécute, puis supprime le fichier temporaire :
+Pour lancer la configuration, exécutez simplement la commande suivante directement dans le terminal de votre Debian (accès à Internet requis). Elle installe `curl` s'il est absent, télécharge le script, l'exécute avec `bash` (le fichier temporaire n'a pas besoin du bit exécutable, ce qui fonctionne même si `/tmp` est monté en `noexec`), puis le supprime :
 
 ```bash
-bash -c 'command -v curl >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl; }; command -v curl >/dev/null 2>&1 || { echo "curl est introuvable : installez-le avec « apt install curl » puis relancez cette commande."; exit 1; }; f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f"; rc=$?; rm -f "$f"; exit $rc'
+bash -c 'command -v curl >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl; }; command -v curl >/dev/null 2>&1 || { echo "curl est introuvable : installez-le avec « apt install curl » puis relancez cette commande."; exit 1; }; f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && bash "$f"; rc=$?; rm -f "$f"; exit $rc'
 ```
 
 Si `curl` manque **et** que son installation échoue (pas de réseau, dépôts injoignables), la commande s'arrête sur un message explicite au lieu d'une erreur obscure.
@@ -134,8 +136,9 @@ Depuis un compte disposant déjà de `sudo`, préfixez la commande : `sudo ./scr
 ### 🧪 Développement
 
 ```bash
-bash -n script-de-personnalisation-post-installation-pour-debian-13.sh   # syntaxe
-shellcheck -s bash -e SC2317 script-de-personnalisation-post-installation-pour-debian-13.sh
+bash -n script-de-personnalisation-post-installation-pour-debian-13.sh   # syntaxe (un fichier par appel :
+bash -n tests/test-fonctions.sh                                          #  bash -n n'analyse que le premier)
+shellcheck -s bash -e SC2317 script-de-personnalisation-post-installation-pour-debian-13.sh tests/test-fonctions.sh
 bash tests/test-fonctions.sh                                             # tests unitaires
 ```
 
@@ -158,8 +161,8 @@ The script automates eight critical setup steps:
 3. **Localization**: Configures the keyboard layout to French (**AZERTY**).
 4. **Identity**: Customizes the machine's hostname, with format validation.
 5. **Static Networking**: Sets up a static IP address **in whichever network stack is already in place**, with pre-flight verification and automatic DHCP rollback.
-6. **User Security**: Creates a standard non-root user with `sudo` privileges.
-7. **SSH Hardening**: Changes the listening port (socket-activation aware, as required on Debian 13) and configures root login.
+6. **User Security**: Creates a standard non-root user and adds it to the `sudo` group. The addition is verified: the final summary flags an account created without `sudo` if it failed.
+7. **SSH Hardening**: Changes the listening port and configures root login. When SSH is started by `ssh.socket` (socket activation, optional on Debian), the `Port` directive is ignored by the system: the script detects this and overrides the socket instead.
 8. **Key-based authentication**: Generates a key pair when the machine is a **client**, installs a public key into `authorized_keys` when it is a **server**, then optionally hardens `sshd` with an automatic rollback.
 
 ### 🔑 SSH key authentication
@@ -198,7 +201,7 @@ The script then checks what actually stops a key from working:
 
 `PubkeyAuthentication yes` is always set. Disabling passwords (`PasswordAuthentication no` **and** `KbdInteractiveAuthentication no`, without which the change would be illusory on Debian) is only offered after a proven key login or an explicit confirmation, and the result is verified through `sshd -T` — if a file in `/etc/ssh/sshd_config.d/` sorting before ours wins, the script names it instead of reporting a success that did not happen.
 
-As with the IP change, an **automatic rollback is armed before the change**: without confirmation within the chosen delay, password authentication is re-enabled on its own.
+As with the IP change, an **automatic rollback is armed before the change**: without confirmation within the chosen delay, password authentication is re-enabled on its own. That timer is transient (`systemd-run`): it does not survive a reboot, unlike the `ssh-cles-rollback` command, which stays available.
 
 | Command | Purpose |
 |---|---|
@@ -216,6 +219,8 @@ Switching to a static IP is the riskiest part of any post-install: a single typo
 | **Non-disruptive live test**: the address is added as a **secondary** one (the DHCP address stays up), then the gateway, DNS resolution and pings to `example.org`, `debian.org` and `cloudflare.com` are checked | Your SSH session is **never** dropped during verification, and nothing is written while the tests fail |
 | **Switch-over at the very end of the script**, run detached via `systemd-run` | An SSH disconnect can no longer interrupt the operation halfway through |
 | **Automatic DHCP rollback**: a systemd timer restores the previous configuration unless you confirm, and a boot-time service does the same if the server does not answer after a reboot | An unreachable server requiring physical or IPMI console access |
+
+The boot-time safeguard and the rollback commands are installed **before the first file is written** (step 5), not only at switch-over time: a reboot or an interrupted script before the end is still covered. If those tools cannot be installed, nothing is written; if a write fails midway, the files already modified are restored. With NetworkManager, the profile file is backed up before modification and restored verbatim on rollback.
 
 After the switch, reconnect on the new address and confirm:
 
@@ -242,10 +247,10 @@ The script therefore detects the actual setup and configures DNS where it will r
 
 > ⚠️ **Run this as `root`, without `sudo`**: `sudo` is not installed by default on Debian 13. Log in as `root`, or switch with `su -`.
 
-To start the configuration, simply run the following command (Internet access required). It installs `curl` when missing, downloads the script, runs it, then removes the temporary file:
+To start the configuration, simply run the following command (Internet access required). It installs `curl` when missing, downloads the script, runs it with `bash` (no executable bit needed, so it works even when `/tmp` is mounted `noexec`), then removes the temporary file:
 
 ```bash
-bash -c 'command -v curl >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl; }; command -v curl >/dev/null 2>&1 || { echo "curl not found: install it with: apt install curl - then run this command again."; exit 1; }; f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && chmod +x "$f" && "$f"; rc=$?; rm -f "$f"; exit $rc'
+bash -c 'command -v curl >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl; }; command -v curl >/dev/null 2>&1 || { echo "curl not found: install it with: apt install curl - then run this command again."; exit 1; }; f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/TutoTech/Script-de-personnalisation-post-installation-pour-serveur-Linux/main/script-de-personnalisation-post-installation-pour-debian-13.sh -o "$f" && bash "$f"; rc=$?; rm -f "$f"; exit $rc'
 ```
 
 If `curl` is missing **and** cannot be installed (no network, unreachable repositories), the command stops with an explicit message instead of an obscure error.
@@ -262,8 +267,9 @@ From an account that already has `sudo`, prefix it: `sudo ./script-de-personnali
 ### 🧪 Development
 
 ```bash
-bash -n script-de-personnalisation-post-installation-pour-debian-13.sh
-shellcheck -s bash -e SC2317 script-de-personnalisation-post-installation-pour-debian-13.sh
+bash -n script-de-personnalisation-post-installation-pour-debian-13.sh   # one file per call: bash -n only
+bash -n tests/test-fonctions.sh                                          #  checks the first argument
+shellcheck -s bash -e SC2317 script-de-personnalisation-post-installation-pour-debian-13.sh tests/test-fonctions.sh
 bash tests/test-fonctions.sh
 ```
 
