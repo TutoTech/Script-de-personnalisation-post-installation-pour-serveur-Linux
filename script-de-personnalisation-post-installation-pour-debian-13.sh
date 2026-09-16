@@ -160,6 +160,7 @@ NET_NM_CONNECTION=""
 NET_NM_KEYFILE=""       # fichier de profil NetworkManager sauvegardé avant modification
 NET_NM_MODIFIED=0       # 1 dès que « nmcli connection modify » a réécrit le profil
 NET_PREVIOUS_PENDING=0  # 1 si une bascule précédente, encore surveillée, est remplacée
+SSH_PREVIOUS_PENDING=0  # 1 si un durcissement précédent, encore surveillé, est remplacé
 NET_IFUPDOWN_FILE=""
 NET_GENERATED_FILES=""
 DHCPCD_NOHOOK_ADDED=0
@@ -167,9 +168,10 @@ DNS_METHOD=""           # resolved | resolvconf | resolvconf-file
 
 # --- Emplacements de travail ---------------------------------------------------
 STATE_DIR="/var/lib/personnalisation-debian13"
-# Horodatage du lancement : suffixe de toutes les sauvegardes et des manifestes
-# de cette exécution (défini ici car les chemins ci-dessous en dépendent).
-RUN_STAMP="$(date +%Y%m%d-%H%M%S)"
+# Identifiant du lancement : suffixe de toutes les sauvegardes et des manifestes
+# de cette exécution (défini ici car les chemins ci-dessous en dépendent). Le
+# PID le rend unique même pour deux lancements dans la même seconde.
+RUN_STAMP="$(date +%Y%m%d-%H%M%S).$$"
 BACKUP_MANIFEST="$STATE_DIR/backups.list"
 # Manifeste SÉPARÉ pour les seuls fichiers réseau : le retour arrière ne doit
 # restaurer QUE le réseau, surtout pas /root/.bashrc, /etc/hosts ou sshd_config
@@ -563,6 +565,26 @@ restore_file() {
 }
 
 ################################################################################
+# FONCTION : Installation atomique d'un fichier depuis l'entrée standard
+################################################################################
+# installer_fichier <destination> <droits> [bash]
+# Le contenu est écrit dans un fichier temporaire du MÊME répertoire, vérifié
+# (« bash -n » si demandé), puis mis en place par « mv » : une interruption ou
+# un disque plein ne laissent jamais un fichier tronqué à la place de l'ancien,
+# qu'un garde-fou encore armé pourrait vouloir exécuter.
+################################################################################
+installer_fichier() {
+  local dest="${1:-}" mode="${2:-644}" verif="${3:-}" tmp
+  [[ -n "$dest" ]] || return 1
+  tmp="$(mktemp "${dest}.XXXXXX")" || return 1
+  if ! cat > "$tmp"; then rm -f "$tmp"; return 1; fi
+  if [[ "$verif" == "bash" ]] && ! bash -n "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if ! chmod "$mode" "$tmp"; then rm -f "$tmp"; return 1; fi
+  if ! mv -f "$tmp" "$dest"; then rm -f "$tmp"; return 1; fi
+  return 0
+}
+
+################################################################################
 # FONCTION : Écriture d'un bloc délimité et idempotent
 ################################################################################
 # write_marked_block <fichier> <marqueur début> <marqueur fin> < contenu
@@ -914,7 +936,7 @@ v_ssh_port() {
 ssh_holds_port() {
   local port="${1:-}" listeners="${2:-}"
   grep -q 'users:(("sshd"' <<< "$listeners" && return 0
-  if grep -q 'users:(("systemd"' <<< "$listeners" && ssh_socket_active &&
+  if grep -q 'users:(("systemd"' <<< "$listeners" && systemctl is-active --quiet ssh.socket 2>/dev/null &&
      systemctl show ssh.socket --property=Listen --value 2>/dev/null | grep -qE "(^|[]:.])${port}( |$)"; then
     return 0
   fi
@@ -1679,7 +1701,13 @@ configure_dns() {
       log_ok "/etc/resolv.conf redirigé vers le résolveur systemd (127.0.0.53)."
     fi
 
-    run_cmd "Redémarrage de systemd-resolved..." systemctl restart systemd-resolved
+    # Pas de run_cmd ici : sur refus de continuer il quitterait le script en
+    # court-circuitant l'annulation ; l'échec doit remonter à l'appelant.
+    log_info "Redémarrage de systemd-resolved..."
+    if ! systemctl restart systemd-resolved; then
+      log_err "systemd-resolved n'a pas pu être redémarré."
+      return 1
+    fi
     log_ok "DNS configuré : $dns (via systemd-resolved)"
     return 0
   fi
@@ -1779,7 +1807,7 @@ install_network_tools() {
   # attente reste protégée tant que son remplacement n'est pas prêt.
 
   # --- Bibliothèque commune ----------------------------------------------------
-  cat > /usr/local/sbin/ip-fixe-commun <<'COMMON' || return 1
+  installer_fichier /usr/local/sbin/ip-fixe-commun 755 bash <<'COMMON' || return 1
 #!/bin/bash
 # Fonctions partagées par les outils de bascule IP fixe.
 # Généré par le script de personnalisation Debian 13.
@@ -1868,10 +1896,9 @@ tester_connectivite() {
   return 1
 }
 COMMON
-  chmod 755 /usr/local/sbin/ip-fixe-commun || return 1
 
   # --- Application de la nouvelle configuration --------------------------------
-  cat > /usr/local/sbin/ip-fixe-appliquer <<'APPLY' || return 1
+  installer_fichier /usr/local/sbin/ip-fixe-appliquer 755 bash <<'APPLY' || return 1
 #!/bin/bash
 # Applique la configuration IP fixe préparée par le script de personnalisation.
 # Exécuté par systemd (donc détaché de toute session SSH).
@@ -1889,10 +1916,9 @@ else
 fi
 exit "$rc"
 APPLY
-  chmod 755 /usr/local/sbin/ip-fixe-appliquer || return 1
 
   # --- Retour arrière -----------------------------------------------------------
-  cat > /usr/local/sbin/ip-fixe-rollback <<'ROLLBACK' || return 1
+  installer_fichier /usr/local/sbin/ip-fixe-rollback 755 bash <<'ROLLBACK' || return 1
 #!/bin/bash
 # Restaure la configuration réseau antérieure (retour au DHCP) si le changement
 # d'adresse IP n'a pas été confirmé.
@@ -1973,16 +1999,33 @@ systemctl daemon-reload >/dev/null 2>&1
 if [ "${NET_STACK:-}" = "networkmanager" ]; then
   if [ -n "${NET_NM_KEYFILE:-}" ] && [ -f "$NET_NM_KEYFILE" ]; then
     # Le fichier du profil d'origine vient d'être restauré à l'identique
-    # (étape 2 ci-dessus) : NetworkManager doit simplement le relire.
-    nmcli connection reload >/dev/null 2>&1
+    # (étape 1 ci-dessus) : NetworkManager doit le relire, sinon le profil
+    # « manual » encore en mémoire serait réappliqué.
+    if ! nmcli connection reload >/dev/null 2>&1; then
+      journal "ÉCHEC : NetworkManager n'a pas relu le profil restauré."
+      echecs=$((echecs + 1))
+    fi
   elif [ "${NET_NM_MODIFIED:-0}" = "1" ] && [ -n "${NET_NM_CONNECTION:-}" ]; then
     # Profil réécrit sans copie disponible : à défaut de mieux, on repasse en
     # DHCP. Jamais si le script n'a pas modifié le profil.
-    nmcli connection modify "$NET_NM_CONNECTION" ipv4.method auto \
-          ipv4.addresses "" ipv4.gateway "" ipv4.dns "" ipv4.ignore-auto-dns no >/dev/null 2>&1
+    if ! nmcli connection modify "$NET_NM_CONNECTION" ipv4.method auto \
+          ipv4.addresses "" ipv4.gateway "" ipv4.dns "" ipv4.ignore-auto-dns no >/dev/null 2>&1; then
+      journal "ÉCHEC : le profil NetworkManager n'a pas pu être remis en DHCP."
+      echecs=$((echecs + 1))
+    fi
   fi
 fi
-appliquer_pile
+
+# La configuration restaurée n'est réappliquée que si la restauration est
+# complète ; sinon on réappliquerait, au moins en partie, l'IP fixe.
+if [ "$echecs" -eq 0 ]; then
+  if ! appliquer_pile; then
+    journal "ÉCHEC de la réapplication de la configuration réseau restaurée."
+    echecs=$((echecs + 1))
+  fi
+else
+  journal "Réapplication ignorée : la restauration est incomplète."
+fi
 
 sleep 3
 if tester_connectivite; then
@@ -2003,10 +2046,9 @@ rm -f /etc/systemd/system/ip-fixe-watchdog.service
 systemctl daemon-reload >/dev/null 2>&1
 exit 0
 ROLLBACK
-  chmod 755 /usr/local/sbin/ip-fixe-rollback || return 1
 
   # --- Confirmation --------------------------------------------------------------
-  cat > /usr/local/sbin/ip-fixe-confirmer <<'CONFIRM' || return 1
+  installer_fichier /usr/local/sbin/ip-fixe-confirmer 755 bash <<'CONFIRM' || return 1
 #!/bin/bash
 # Confirme définitivement le changement d'adresse IP et désarme tous les
 # mécanismes de retour automatique.
@@ -2032,10 +2074,9 @@ echo "  Le retour automatique au DHCP est désactivé."
 journal "Changement d'IP confirmé par l'administrateur."
 exit 0
 CONFIRM
-  chmod 755 /usr/local/sbin/ip-fixe-confirmer || return 1
 
   # --- Garde-fou au démarrage -----------------------------------------------------
-  cat > /usr/local/sbin/ip-fixe-watchdog <<'WATCHDOG' || return 1
+  installer_fichier /usr/local/sbin/ip-fixe-watchdog 755 bash <<'WATCHDOG' || return 1
 #!/bin/bash
 # Vérifie la connectivité au premier démarrage suivant un changement d'IP.
 # En cas d'échec, restaure automatiquement la configuration précédente.
@@ -2074,9 +2115,8 @@ journal "Démarrage avec l'IP fixe : aucune connectivité après 60 s, retour à
 /usr/local/sbin/ip-fixe-rollback
 exit 0
 WATCHDOG
-  chmod 755 /usr/local/sbin/ip-fixe-watchdog || return 1
 
-  cat > /etc/systemd/system/ip-fixe-watchdog.service <<'UNIT' || return 1
+  installer_fichier /etc/systemd/system/ip-fixe-watchdog.service 644 <<'UNIT' || return 1
 [Unit]
 Description=Garde-fou IP fixe (retour automatique au DHCP si le réseau ne répond pas)
 After=network-online.target
@@ -2104,6 +2144,14 @@ UNIT
   # strictement intacte (mêmes commandes, même unité, même état).
   systemctl daemon-reload >/dev/null 2>&1 || return 1
   systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1 || return 1
+
+  # Une bascule précédente encore surveillée est remplacée : son état est mis
+  # de côté pour être rétabli si l'écriture de la nouvelle configuration
+  # échoue (voir l'étape 5). Ses manifestes, propres à son exécution, restent
+  # intacts.
+  if (( NET_PREVIOUS_PENDING )) && [[ -f "$ROLLBACK_STATE" ]]; then
+    cp -a "$ROLLBACK_STATE" "$STATE_DIR/rollback.env.precedent" || return 1
+  fi
 
   # L'état partagé est écrit (atomiquement) avant de désarmer les anciens
   # garde-fous : à aucun moment un outil ne peut tourner sans état. Il est
@@ -2215,7 +2263,7 @@ desinstaller_outils_reseau() {
   rm -f /usr/local/sbin/ip-fixe-commun /usr/local/sbin/ip-fixe-appliquer \
         /usr/local/sbin/ip-fixe-rollback /usr/local/sbin/ip-fixe-confirmer \
         /usr/local/sbin/ip-fixe-watchdog
-  rm -f "$ROLLBACK_STATE" "$NET_GENERATED_LIST" "$NET_BACKUP_MANIFEST" "$CONFIRMED_FLAG" "$RUNTIME_CONFIRMED_FLAG"
+  rm -f "$ROLLBACK_STATE" "$STATE_DIR/rollback.env.precedent" "$NET_GENERATED_LIST" "$NET_BACKUP_MANIFEST" "$CONFIRMED_FLAG" "$RUNTIME_CONFIRMED_FLAG"
   log_info "Outils de bascule retirés : aucune IP fixe n'est en attente."
   return 0
 }
@@ -2259,8 +2307,12 @@ annuler_ecriture_reseau() {
   esac
   if [[ "$NET_STACK" == "networkmanager" ]]; then
     if [[ -n "$NET_NM_KEYFILE" ]]; then
-      # Le fichier du profil vient d'être restauré via le manifeste : à relire.
-      nmcli connection reload >/dev/null 2>&1 || true
+      # Le fichier du profil vient d'être restauré via le manifeste : à relire,
+      # sinon le profil « manual » encore en mémoire resterait en vigueur.
+      if ! nmcli connection reload >/dev/null 2>&1; then
+        log_err "NetworkManager n'a pas relu le profil restauré."
+        echecs=$((echecs + 1))
+      fi
     elif (( NET_NM_MODIFIED )) && [[ -n "$NET_NM_CONNECTION" ]]; then
       # Pas de copie du profil alors qu'il a été réécrit en « manual » : même
       # repli que l'outil de retour arrière, retour en DHCP.
@@ -3008,7 +3060,7 @@ install_ssh_auth_tools() {
   # L'ORDRE COMPTE : les commandes d'abord, puis l'état, et seulement ensuite le
   # désarmement d'un garde-fou précédent — qui reste ainsi en place tant que son
   # remplacement n'est pas prêt.
-  cat > /usr/local/sbin/ssh-cles-rollback <<'ROLLBACK' || return 1
+  installer_fichier /usr/local/sbin/ssh-cles-rollback 755 bash <<'ROLLBACK' || return 1
 #!/bin/bash
 # Réactive l'authentification par mot de passe tant que le durcissement n'a pas
 # été confirmé. Généré par le script de personnalisation Debian 13.
@@ -3064,9 +3116,8 @@ else
 fi
 exit 0
 ROLLBACK
-  chmod 755 /usr/local/sbin/ssh-cles-rollback || return 1
 
-  cat > /usr/local/sbin/ssh-cles-confirmer <<'CONFIRM' || return 1
+  installer_fichier /usr/local/sbin/ssh-cles-confirmer 755 bash <<'CONFIRM' || return 1
 #!/bin/bash
 # Valide le durcissement SSH et désarme le retour automatique.
 # Généré par le script de personnalisation Debian 13.
@@ -3090,7 +3141,6 @@ echo "✓ Durcissement confirmé : l'authentification par mot de passe reste dé
 echo "  Pour la réactiver plus tard : sudo ssh-cles-rollback"
 exit 0
 CONFIRM
-  chmod 755 /usr/local/sbin/ssh-cles-confirmer || return 1
   [[ -x /usr/local/sbin/ssh-cles-rollback && -x /usr/local/sbin/ssh-cles-confirmer ]] || return 1
 
   # État écrit atomiquement (fichier à côté puis « mv ») avec un échappement
@@ -3114,6 +3164,28 @@ CONFIRM
   systemctl stop ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
   systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
   rm -f "$SSH_AUTH_CONFIRMED_FLAG"
+  return 0
+}
+
+################################################################################
+# FONCTION : Filet de l'ancien durcissement abandonné en cours de remplacement
+################################################################################
+# Quand un durcissement PRÉCÉDENT (mot de passe déjà coupé, minuterie désarmée
+# par le remplacement) est abandonné avant qu'un nouveau filet soit armé, la
+# machine ne doit pas rester sans retour possible : le mot de passe est
+# réactivé tout de suite, ce que l'ancienne minuterie aurait fait à son heure.
+################################################################################
+reactiver_mot_de_passe_si_orphelin() {
+  local cible="${1:-}"
+  (( SSH_PREVIOUS_PENDING )) || return 0
+  (( SSH_AUTH_ROLLBACK_ARMED )) && return 0
+  log_warn "Le durcissement précédent n'a plus de retour automatique : réactivation immédiate du mot de passe."
+  if [[ -x /usr/local/sbin/ssh-cles-rollback ]] && /usr/local/sbin/ssh-cles-rollback >/dev/null 2>&1; then
+    log_ok "Authentification par mot de passe réactivée."
+  else
+    log_err "Réactivation impossible : posez « PasswordAuthentication yes » dans ${cible:-la configuration sshd} depuis la console."
+  fi
+  SSH_PREVIOUS_PENDING=0
   return 0
 }
 
@@ -4000,6 +4072,7 @@ durcir_authentification() {
       log_info "Durcissement ignoré : le précédent reste sous surveillance."
       return 0
     fi
+    SSH_PREVIOUS_PENDING=1
   fi
 
   # Sauvegardes AVANT toute modification : sans elles, la restauration de secours
@@ -4119,6 +4192,7 @@ durcir_authentification() {
       echo ""
       if ! ask_yes_no "Désactiver le mot de passe SANS filet de sécurité ?" "n"; then
         log_info "Authentification par mot de passe conservée."
+        reactiver_mot_de_passe_si_orphelin "$cible"
         return 0
       fi
     fi
@@ -4143,6 +4217,9 @@ durcir_authentification() {
       systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
       SSH_AUTH_ROLLBACK_ARMED=0
     fi
+    # Le fichier restauré est celui d'AVANT ce durcissement : si un durcissement
+    # précédent y avait déjà coupé le mot de passe, il n'a plus de filet.
+    reactiver_mot_de_passe_si_orphelin "$cible"
     SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
     return 1
   fi
@@ -4708,6 +4785,8 @@ if (( NET_STEP_ALLOWED )) && ask_yes_no "Souhaitez-vous configurer une IP fixe ?
       if (( NET_WRITE_OK )); then
         NET_CONFIGURED=1
         NET_PENDING_APPLY=1
+        # Le remplacement est complet : l'état de la bascule précédente ne sert plus.
+        rm -f "$STATE_DIR/rollback.env.precedent"
 
         echo ""
         log_ok "CONFIGURATION RÉSEAU ENREGISTRÉE (pas encore appliquée)"
@@ -4730,8 +4809,21 @@ if (( NET_STEP_ALLOWED )) && ask_yes_no "Souhaitez-vous configurer une IP fixe ?
         # de démarrage conservé doit connaître les fichiers à restaurer.
         ecrire_etat_bascule || true
         if annuler_ecriture_reseau; then
-          desinstaller_outils_reseau
-          echo "  Le serveur conserve sa configuration actuelle."
+          if (( NET_PREVIOUS_PENDING )) && [[ -f "$STATE_DIR/rollback.env.precedent" ]]; then
+            # La bascule précédente redevient celle sous surveillance : son état
+            # est rétabli et le garde-fou de démarrage reste actif. Sa minuterie
+            # ne peut pas être réarmée avec son délai d'origine : à l'utilisateur
+            # de confirmer ou d'annuler.
+            if mv -f "$STATE_DIR/rollback.env.precedent" "$ROLLBACK_STATE"; then
+              log_warn "Garde-fous du changement précédent rétablis : garde-fou de démarrage actif, minuterie NON réarmée."
+              echo "  Confirmez ce changement (sudo ip-fixe-confirmer) ou annulez-le (sudo ip-fixe-rollback)."
+            else
+              log_err "Impossible de rétablir l'état du changement précédent : vérifiez $STATE_DIR à la console."
+            fi
+          else
+            desinstaller_outils_reseau
+            echo "  Le serveur conserve sa configuration actuelle."
+          fi
         else
           log_err "Restauration incomplète : le garde-fou de démarrage est LAISSÉ EN PLACE."
           echo "  Au prochain redémarrage, il restaurera la configuration précédente si le"
