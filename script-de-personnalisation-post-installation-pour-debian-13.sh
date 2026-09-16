@@ -2193,33 +2193,41 @@ UNIT
   systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1 || return 1
 
   # Une bascule précédente encore surveillée est remplacée : son état est mis
-  # de côté pour être rétabli si l'écriture de la nouvelle configuration
-  # échoue (voir l'étape 5). Ses manifestes, propres à son exécution, restent
-  # intacts.
+  # de côté pour être rétabli si quoi que ce soit échoue ensuite (ici ou à
+  # l'écriture de la nouvelle configuration, voir l'étape 5). Ses manifestes,
+  # propres à son exécution, restent intacts.
+  rm -f "$STATE_DIR/rollback.env.precedent"
   if (( NET_PREVIOUS_PENDING )) && [[ -f "$ROLLBACK_STATE" ]]; then
     cp -a "$ROLLBACK_STATE" "$STATE_DIR/rollback.env.precedent" || return 1
   fi
 
-  # L'état partagé est écrit (atomiquement) avant de désarmer les anciens
-  # garde-fous : à aucun moment un outil ne peut tourner sans état. Il est
-  # remis à jour à chaque phase d'écriture (voir ecrire_etat_bascule).
-  ecrire_etat_bascule || return 1
-
-  # Le remplacement est prêt et complet : les garde-fous d'une exécution
-  # PRÉCÉDENTE sont désarmés maintenant seulement. Une minuterie encore armée
-  # lirait le nouvel état ; un retour arrière, un garde-fou ou une application
-  # encore EN COURS modifierait le réseau pendant qu'on le reconfigure
-  # (« systemctl stop » attend la fin de l'unité, « reset-failed » n'arrête
-  # rien). Le drapeau de confirmation de cette exécution précédente désarmerait
-  # immédiatement les nouveaux garde-fous : il est retiré.
-  arreter_unites ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-watchdog.service ip-fixe-appliquer.service || return 1
+  # Les unités d'une exécution PRÉCÉDENTE sont arrêtées AVANT la publication du
+  # nouvel état : aucune ne peut lire un état qui ne la concerne pas, et un
+  # retour arrière, un garde-fou ou une application encore EN COURS ne peut
+  # plus modifier le réseau pendant qu'on le reconfigure (« systemctl stop »
+  # attend la fin de l'unité, « reset-failed » n'arrête rien). À partir d'ici,
+  # tout échec rétablit l'état précédent (retablir_etat_precedent) ; sa
+  # minuterie, elle, ne peut pas être réarmée avec son délai d'origine.
+  if ! arreter_unites ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-watchdog.service ip-fixe-appliquer.service; then
+    retablir_etat_precedent
+    return 1
+  fi
   systemctl reset-failed ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-appliquer.service ip-fixe-watchdog.service >/dev/null 2>&1 || true
+
+  # L'état partagé est publié (atomiquement) : les outils disposent d'un état
+  # cohérent à tout instant. Il est remis à jour à chaque phase d'écriture
+  # (voir ecrire_etat_bascule). Le drapeau de confirmation de l'exécution
+  # précédente désarmerait immédiatement les nouveaux garde-fous : retiré.
+  if ! ecrire_etat_bascule; then
+    retablir_etat_precedent
+    return 1
+  fi
   rm -f "$CONFIRMED_FLAG" "$RUNTIME_CONFIRMED_FLAG"
 
-  # Si l'ancien retour arrière s'est déclenché dans l'intervalle (quelques
-  # millisecondes), il a pu retirer l'unité du garde-fou : elle est réaffirmée.
+  # L'unité du garde-fou est réaffirmée (l'ancien retour arrière a pu la
+  # retirer juste avant d'être arrêté) puis activée.
   if [[ ! -f /etc/systemd/system/ip-fixe-watchdog.service ]]; then
-    installer_fichier /etc/systemd/system/ip-fixe-watchdog.service 644 <<'UNIT2' || return 1
+    if ! installer_fichier /etc/systemd/system/ip-fixe-watchdog.service 644 <<'UNIT2'
 [Unit]
 Description=Garde-fou IP fixe (retour automatique au DHCP si le réseau ne répond pas)
 After=network-online.target
@@ -2233,10 +2241,36 @@ RemainAfterExit=no
 [Install]
 WantedBy=multi-user.target
 UNIT2
-    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    then
+      retablir_etat_precedent
+      return 1
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || { retablir_etat_precedent; return 1; }
   fi
-  systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1 || return 1
+  systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1 || { retablir_etat_precedent; return 1; }
   log_ok "Garde-fou de démarrage installé (retour automatique au DHCP si le réseau ne répond pas)."
+  return 0
+}
+
+################################################################################
+# FONCTION : Rétablissement de l'état d'une bascule précédente remplacée
+################################################################################
+# Appelée quand le remplacement d'une bascule encore surveillée échoue après
+# l'arrêt de ses unités : son état redevient l'état publié et son garde-fou de
+# démarrage est réactivé. Sa minuterie ne peut pas être réarmée avec le délai
+# d'origine : l'utilisateur est invité à confirmer ou annuler lui-même.
+################################################################################
+retablir_etat_precedent() {
+  (( NET_PREVIOUS_PENDING )) || return 0
+  [[ -f "$STATE_DIR/rollback.env.precedent" ]] || return 0
+  if mv -f "$STATE_DIR/rollback.env.precedent" "$ROLLBACK_STATE"; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1 || true
+    log_warn "État du changement précédent rétabli : garde-fou de démarrage actif, minuterie NON réarmée."
+    echo "  Confirmez ce changement (sudo ip-fixe-confirmer) ou annulez-le (sudo ip-fixe-rollback)." >&2
+  else
+    log_err "Impossible de rétablir l'état du changement précédent : vérifiez $STATE_DIR à la console."
+  fi
   return 0
 }
 
@@ -3226,27 +3260,51 @@ exit 0
 CONFIRM
   [[ -x /usr/local/sbin/ssh-cles-rollback && -x /usr/local/sbin/ssh-cles-confirmer ]] || return 1
 
+  # Un durcissement précédent encore surveillé est remplacé : son état est mis
+  # de côté, puis sa minuterie est arrêtée AVANT la publication du nouvel état,
+  # pour qu'elle ne lise jamais un état qui ne la concerne pas. Si la
+  # publication échoue ensuite, l'ancien état est rétabli ; sa minuterie ne
+  # pouvant pas être réarmée, l'appelant réactive alors le mot de passe
+  # (reactiver_mot_de_passe_si_orphelin).
+  local precedent="$STATE_DIR/ssh-auth.env.precedent"
+  rm -f "$precedent"
+  if (( SSH_PREVIOUS_PENDING )) && [[ -f "$SSH_AUTH_STATE" ]]; then
+    cp -a "$SSH_AUTH_STATE" "$precedent" || return 1
+  fi
+  arreter_unites ssh-cles-rollback.timer ssh-cles-rollback.service || return 1
+  systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
+
   # État écrit atomiquement (fichier à côté puis « mv ») avec un échappement
   # shell réel des valeurs (« printf %q »).
   local tmp
-  tmp="$(mktemp "$STATE_DIR/ssh-auth.env.XXXXXX")" || return 1
-  {
-    echo "# État du durcissement SSH — généré le $(date)"
-    printf 'SSHD_TARGET=%q\n'        "$target"
-    printf 'SSHD_TARGET_BACKUP=%q\n' "${target}.bak.${RUN_STAMP}"
-    printf 'SSHD_MAIN_BACKUP=%q\n'   "/etc/ssh/sshd_config.bak.${RUN_STAMP}"
-    printf 'CONFIRMED_FLAG=%q\n'     "$SSH_AUTH_CONFIRMED_FLAG"
-  } > "$tmp" || { rm -f "$tmp"; return 1; }
-  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f "$tmp" "$SSH_AUTH_STATE" || { rm -f "$tmp"; return 1; }
+  if ! tmp="$(mktemp "$STATE_DIR/ssh-auth.env.XXXXXX")"; then
+    retablir_etat_ssh_precedent
+    return 1
+  fi
+  if ! {
+      echo "# État du durcissement SSH — généré le $(date)"
+      printf 'SSHD_TARGET=%q\n'        "$target"
+      printf 'SSHD_TARGET_BACKUP=%q\n' "${target}.bak.${RUN_STAMP}"
+      printf 'SSHD_MAIN_BACKUP=%q\n'   "/etc/ssh/sshd_config.bak.${RUN_STAMP}"
+      printf 'CONFIRMED_FLAG=%q\n'     "$SSH_AUTH_CONFIRMED_FLAG"
+    } > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$SSH_AUTH_STATE"; then
+    rm -f "$tmp"
+    retablir_etat_ssh_precedent
+    return 1
+  fi
+  # Le drapeau de confirmation de l'exécution précédente désarmerait le
+  # nouveau garde-fou : retiré. L'ancien état n'a plus à être rétabli.
+  rm -f "$SSH_AUTH_CONFIRMED_FLAG" "$precedent"
+  return 0
+}
 
-  # Le remplacement est prêt : une minuterie encore armée par une exécution
-  # précédente lirait le nouvel état et réactiverait le mot de passe plus tard,
-  # que le nouveau durcissement soit minuté ou non ; son drapeau de confirmation
-  # désarmerait le nouveau garde-fou. On repart de zéro.
-  arreter_unites ssh-cles-rollback.timer ssh-cles-rollback.service || return 1
-  systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
-  rm -f "$SSH_AUTH_CONFIRMED_FLAG"
+# Remet en place l'état d'un durcissement précédent quand son remplacement a
+# échoué après l'arrêt de sa minuterie.
+retablir_etat_ssh_precedent() {
+  local precedent="$STATE_DIR/ssh-auth.env.precedent"
+  [[ -f "$precedent" ]] || return 0
+  mv -f "$precedent" "$SSH_AUTH_STATE" ||
+    log_err "Impossible de rétablir l'état du durcissement précédent : vérifiez $STATE_DIR à la console."
   return 0
 }
 
@@ -3262,6 +3320,9 @@ reactiver_mot_de_passe_si_orphelin() {
   local cible="${1:-}"
   (( SSH_PREVIOUS_PENDING )) || return 0
   (( SSH_AUTH_ROLLBACK_ARMED )) && return 0
+  # L'ancienne minuterie tourne encore (son arrêt a échoué) : elle fera son
+  # travail à son heure, rien à faire ici.
+  systemctl is-active --quiet ssh-cles-rollback.timer 2>/dev/null && return 0
   log_warn "Le durcissement précédent n'a plus de retour automatique : réactivation immédiate du mot de passe."
   if [[ -x /usr/local/sbin/ssh-cles-rollback ]] && /usr/local/sbin/ssh-cles-rollback >/dev/null 2>&1; then
     log_ok "Authentification par mot de passe réactivée."
@@ -4257,6 +4318,9 @@ durcir_authentification() {
     echo ""
     if ! ask_yes_no "Désactiver le mot de passe SANS aucun filet de sécurité ?" "n"; then
       log_info "Authentification par mot de passe conservée."
+      # Si un durcissement précédent a perdu sa minuterie dans l'opération,
+      # son mot de passe est réactivé tout de suite.
+      reactiver_mot_de_passe_si_orphelin "$cible"
       return 0
     fi
     delai=0
@@ -4291,18 +4355,26 @@ durcir_authentification() {
 
   if ! "$bin" -t 2>/dev/null; then
     log_err "Configuration invalide : restauration immédiate."
-    sshd_restore_or_remove "$cible"
-    ssh_reload_config || true
-    # La minuterie, si elle a été armée, réécrirait à son échéance le fichier
-    # tout juste restauré : elle est désarmée, il n'y a plus rien à défaire.
-    if (( SSH_AUTH_ROLLBACK_ARMED )); then
-      systemctl stop ssh-cles-rollback.timer >/dev/null 2>&1 || true
-      systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
-      SSH_AUTH_ROLLBACK_ARMED=0
+    if sshd_restore_or_remove "$cible"; then
+      ssh_reload_config || true
+      # La minuterie, si elle a été armée, réécrirait à son échéance le fichier
+      # tout juste restauré : elle est désarmée, il n'y a plus rien à défaire.
+      if (( SSH_AUTH_ROLLBACK_ARMED )); then
+        systemctl stop ssh-cles-rollback.timer >/dev/null 2>&1 || true
+        systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
+        SSH_AUTH_ROLLBACK_ARMED=0
+      fi
+      # Le fichier restauré est celui d'AVANT ce durcissement : si un
+      # durcissement précédent y avait déjà coupé le mot de passe, il n'a plus
+      # de filet.
+      reactiver_mot_de_passe_si_orphelin "$cible"
+    elif (( SSH_AUTH_ROLLBACK_ARMED )); then
+      # Restauration impossible (disque plein, lecture seule…) : la minuterie
+      # reste le dernier filet, elle réactivera le mot de passe à son échéance.
+      log_warn "Restauration impossible : la minuterie de retour automatique est LAISSÉE ARMÉE (mot de passe réactivé dans $SSH_AUTH_ROLLBACK_DELAY min)."
+    else
+      log_err "Restauration impossible et aucune minuterie : rétablissez $cible depuis la console (sshd -t)."
     fi
-    # Le fichier restauré est celui d'AVANT ce durcissement : si un durcissement
-    # précédent y avait déjà coupé le mot de passe, il n'a plus de filet.
-    reactiver_mot_de_passe_si_orphelin "$cible"
     SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
     return 1
   fi
@@ -4841,9 +4913,10 @@ if (( NET_STEP_ALLOWED )) && ask_yes_no "Souhaitez-vous configurer une IP fixe ?
       echo "  Sans garde-fou, appliquer une IP fixe serait un pari : rien n'est écrit,"
       echo "  le serveur conserve sa configuration actuelle."
       if (( NET_PREVIOUS_PENDING )); then
-        # L'installation échoue toujours AVANT de toucher aux garde-fous
-        # précédents (voir install_network_tools) : ils restent en place.
-        log_warn "Les garde-fous du changement précédent sont laissés en place, rien n'a été remplacé."
+        # Soit rien n'a été touché (échec avant l'arrêt des anciennes unités),
+        # soit install_network_tools a déjà rétabli l'état précédent.
+        log_warn "Le changement précédent reste sous surveillance de son garde-fou de démarrage ; sa minuterie a pu être désarmée."
+        echo "  Confirmez-le (sudo ip-fixe-confirmer) ou annulez-le (sudo ip-fixe-rollback)."
       else
         desinstaller_outils_reseau
       fi
@@ -4900,16 +4973,8 @@ if (( NET_STEP_ALLOWED )) && ask_yes_no "Souhaitez-vous configurer une IP fixe ?
         ecrire_etat_bascule || true
         if annuler_ecriture_reseau; then
           if (( NET_PREVIOUS_PENDING )) && [[ -f "$STATE_DIR/rollback.env.precedent" ]]; then
-            # La bascule précédente redevient celle sous surveillance : son état
-            # est rétabli et le garde-fou de démarrage reste actif. Sa minuterie
-            # ne peut pas être réarmée avec son délai d'origine : à l'utilisateur
-            # de confirmer ou d'annuler.
-            if mv -f "$STATE_DIR/rollback.env.precedent" "$ROLLBACK_STATE"; then
-              log_warn "Garde-fous du changement précédent rétablis : garde-fou de démarrage actif, minuterie NON réarmée."
-              echo "  Confirmez ce changement (sudo ip-fixe-confirmer) ou annulez-le (sudo ip-fixe-rollback)."
-            else
-              log_err "Impossible de rétablir l'état du changement précédent : vérifiez $STATE_DIR à la console."
-            fi
+            # La bascule précédente redevient celle sous surveillance.
+            retablir_etat_precedent
           else
             desinstaller_outils_reseau
             echo "  Le serveur conserve sa configuration actuelle."
@@ -5204,12 +5269,16 @@ if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
         [[ -n "$SSHD_TEST_LOG" ]] && sed -e 's/^/    /' "$SSHD_TEST_LOG" >&2
         echo ""
         log_warn "Restauration de la configuration précédente pour ne pas perdre l'accès SSH."
+        SSHD_RESTORE_OK=1
         if [[ "$SSHD_TARGET" != "/etc/ssh/sshd_config" ]]; then
             # Le fichier d'inclusion est soit restauré depuis sa sauvegarde
             # (s'il préexistait), soit supprimé (si c'est nous qui l'avons créé).
-            sshd_restore_or_remove "$SSHD_TARGET"
+            sshd_restore_or_remove "$SSHD_TARGET" || SSHD_RESTORE_OK=0
         fi
-        restore_file /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.${RUN_STAMP}" || true
+        restore_file /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.${RUN_STAMP}" || SSHD_RESTORE_OK=0
+        if (( ! SSHD_RESTORE_OK )); then
+            log_err "Restauration incomplète : NE FERMEZ PAS cette session et rétablissez /etc/ssh depuis celle-ci (sshd -t) avant tout redémarrage de SSH."
+        fi
         SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
     fi
     [[ -n "$SSHD_TEST_LOG" ]] && rm -f "$SSHD_TEST_LOG"
