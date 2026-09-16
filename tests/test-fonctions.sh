@@ -384,6 +384,37 @@ ko "ens18 n'est plus mentionnée (inet6 seule ne compte pas)" ifupdown_file_ment
 ko "fichier inexistant refusé"           ifupdown_strip_iface_stanzas "$TMP_IF-absent" ens18
 rm -f "$TMP_IF"
 
+# Configuration IPv6 seule : sans strophe « inet », RIEN n'est retiré, pas même
+# « allow-hotplug », sinon l'IPv6 cesserait de s'activer au démarrage.
+TMP_IF="$(mktemp)"
+printf 'allow-hotplug ens18\niface ens18 inet6 auto\n' > "$TMP_IF"
+ko   "IPv6 seule : non « mentionnée »"     ifupdown_file_mentions_iface "$TMP_IF" ens18
+ok   "IPv6 seule : strip renvoie 0"        ifupdown_strip_iface_stanzas "$TMP_IF" ens18
+egal "IPv6 seule : allow-hotplug conservé" "1" "$(grep -c '^allow-hotplug ens18$' "$TMP_IF")"
+egal "IPv6 seule : strophe inet6 conservée" "1" "$(grep -c '^iface ens18 inet6 auto$' "$TMP_IF")"
+rm -f "$TMP_IF"
+
+echo "== ecrire_etat_bascule / declarer_fichier_genere =="
+# L'état partagé doit rester sourçable quelles que soient les valeurs (un nom de
+# profil NetworkManager peut contenir une apostrophe) et être écrit en 600.
+TMP_ETAT="$(mktemp -d)"
+# shellcheck disable=SC2034
+STATE_DIR="$TMP_ETAT" ROLLBACK_STATE="$TMP_ETAT/rollback.env" NET_GENERATED_LIST="$TMP_ETAT/gen.list" NET_BACKUP_MANIFEST="$TMP_ETAT/manifest"
+# shellcheck disable=SC2034
+NET_STACK="networkmanager" NET_NM_CONNECTION="Wired connection 1 (l'apostrophe)" NET_GENERATED_FILES="" NET_BACKUP_MODE=1
+ok   "déclaration d'un fichier généré"     declarer_fichier_genere "$TMP_ETAT/10-ens18"
+egal "journal disque alimenté"             "$TMP_ETAT/10-ens18" "$(cat "$TMP_ETAT/gen.list")"
+egal "liste mémoire alimentée"             " $TMP_ETAT/10-ens18" "$NET_GENERATED_FILES"
+ok   "état écrit"                          ecrire_etat_bascule
+egal "état en 600"                         "600" "$(stat -c '%a' "$TMP_ETAT/rollback.env")"
+egal "apostrophe relue à l'identique"      "Wired connection 1 (l'apostrophe)" "$(bash -c '. "$1"; printf %s "$NET_NM_CONNECTION"' _ "$TMP_ETAT/rollback.env")"
+egal "domaines de test relus"              "example.org debian.org cloudflare.com" "$(bash -c '. "$1"; printf %s "$TEST_DOMAINS"' _ "$TMP_ETAT/rollback.env")"
+egal "journal des fichiers générés référencé" "$TMP_ETAT/gen.list" "$(bash -c '. "$1"; printf %s "$GENERATED_LIST"' _ "$TMP_ETAT/rollback.env")"
+egal "aucun fichier temporaire laissé"     "0" "$(find "$TMP_ETAT" -name 'rollback.env.*' | wc -l | tr -d ' ')"
+# shellcheck disable=SC2034
+NET_BACKUP_MODE=0
+rm -rf "$TMP_ETAT"
+
 echo "== annuler_ecriture_reseau =="
 # Retire les fichiers générés, restaure ceux du manifeste réseau, et renvoie 1
 # si une restauration échoue (le garde-fou de démarrage est alors conservé).

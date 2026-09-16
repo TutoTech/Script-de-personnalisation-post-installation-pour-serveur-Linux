@@ -171,6 +171,11 @@ BACKUP_MANIFEST="$STATE_DIR/backups.list"
 # restaurer QUE le réseau, surtout pas /root/.bashrc, /etc/hosts ou sshd_config
 # qui ont pu être modifiés par les autres étapes.
 NET_BACKUP_MANIFEST="$STATE_DIR/network-backups.list"
+# Journal SUR DISQUE des fichiers générés par l'étape réseau, alimenté AVANT
+# chaque création : un retour arrière déclenché entre deux phases (Ctrl+C,
+# coupure) sait ainsi quoi retirer, même si l'état partagé n'a pas encore été
+# mis à jour.
+NET_GENERATED_LIST="$STATE_DIR/network-generated.list"
 NET_BACKUP_MODE=0
 ROLLBACK_STATE="$STATE_DIR/rollback.env"
 CONFIRMED_FLAG="$STATE_DIR/confirmed"
@@ -1318,9 +1323,6 @@ ifupdown_file_mentions_iface() {
   [[ -f "$file" && -n "$iface" ]] || return 1
   awk -v ifc="$iface" '
     $1 == "iface" && $2 == ifc && $3 == "inet" { found = 1; exit }
-    $1 ~ /^(auto|allow-[a-z]+)$/ {
-      for (i = 2; i <= NF; i++) if ($i == ifc) { found = 1; exit }
-    }
     END { exit !found }
   ' "$file"
 }
@@ -1329,16 +1331,20 @@ ifupdown_strip_iface_stanzas() {
   local file="${1:-}" iface="${2:-}" tmp
   [[ -f "$file" && -n "$iface" ]] || return 1
   tmp="$(mktemp)" || return 1
+  # Deux lectures du même fichier : la première cherche une strophe IPv4 de la
+  # carte ; sans elle, RIEN n'est retiré, pas même « auto »/« allow-hotplug »,
+  # sinon une configuration IPv6 seule cesserait de s'activer au démarrage.
   if awk -v ifc="$iface" '
       function est_debut_strophe(l) {
         return (l ~ /^[[:space:]]*(auto|allow-[a-z]+|iface|mapping|source|source-directory|no-auto-down|no-scripts)([[:space:]]|$)/)
       }
-      BEGIN { skip = 0 }
+      NR == FNR { if ($1 == "iface" && $2 == ifc && $3 == "inet") has_inet = 1; next }
+      FNR == 1 { skip = 0 }
       {
         if (est_debut_strophe($0)) {
           skip = 0
-          if ($1 == "iface" && $2 == ifc && $3 == "inet") { skip = 1; next }
-          if ($1 ~ /^(auto|allow-[a-z]+)$/) {
+          if (has_inet && $1 == "iface" && $2 == ifc && $3 == "inet") { skip = 1; next }
+          if (has_inet && $1 ~ /^(auto|allow-[a-z]+)$/) {
             reste = $1; n = 0
             for (i = 2; i <= NF; i++) if ($i != ifc) { reste = reste " " $i; n++ }
             if (n == 0) next
@@ -1348,7 +1354,7 @@ ifupdown_strip_iface_stanzas() {
         }
         if (!skip) print
       }
-    ' "$file" > "$tmp" && cat "$tmp" > "$file"; then
+    ' "$file" "$file" > "$tmp" && cat "$tmp" > "$file"; then
     rm -f "$tmp"
     return 0
   fi
@@ -1422,9 +1428,9 @@ write_ifupdown_config() {
       log_info "Strophes existantes de $iface retirées de $other (fichier sauvegardé)."
     done
 
-    # Listé AVANT l'écriture : un fichier créé mais incomplet doit être retiré
-    # par l'annulation.
-    NET_GENERATED_FILES="$NET_GENERATED_FILES $target"
+    # Déclaré AVANT l'écriture (mémoire ET journal sur disque) : un fichier créé
+    # mais incomplet doit être retiré par l'annulation ou le retour arrière.
+    declarer_fichier_genere "$target" || return 1
     {
       echo "# Interface $iface : adresse IP fixe"
       echo "# Générée par le script de personnalisation Debian 13 le $(date)"
@@ -1493,9 +1499,9 @@ write_networkd_config() {
 
   backup_file "$target" || return 1
 
-  # Listé AVANT l'écriture : un fichier créé mais incomplet doit être retiré
-  # par l'annulation.
-  NET_GENERATED_FILES="$NET_GENERATED_FILES $target"
+  # Déclaré AVANT l'écriture (mémoire ET journal sur disque) : un fichier créé
+  # mais incomplet doit être retiré par l'annulation ou le retour arrière.
+  declarer_fichier_genere "$target" || return 1
 
   cat > "$target" <<EOF || return 1
 # Configuration réseau pour l'interface $iface
@@ -1558,15 +1564,21 @@ write_nm_config() {
   local keyfile
   keyfile="$(nmcli -t -f NAME,FILENAME connection show 2>/dev/null |
              awk -F: -v n="$con" '$1 == n { sub(/^[^:]*:/, ""); print; exit }')"
-  if [[ -n "$keyfile" && -f "$keyfile" ]]; then
-    if backup_file "$keyfile" "$STATE_DIR/nm-backups/$(basename "$keyfile").bak.${RUN_STAMP}"; then
-      NET_NM_KEYFILE="$keyfile"
-    else
-      log_warn "Profil « $con » non sauvegardé : le retour arrière repassera simplement en DHCP."
-    fi
-  else
-    log_warn "Fichier du profil « $con » introuvable : le retour arrière repassera simplement en DHCP."
+  if [[ -z "$keyfile" || ! -f "$keyfile" ]]; then
+    log_err "Fichier du profil « $con » introuvable : sans copie, aucun retour arrière fidèle n'est possible."
+    echo "  Un simple retour en DHCP effacerait les réglages IPv4 antérieurs du profil." >&2
+    echo "  Vérifiez avec « nmcli -f NAME,FILENAME connection show » que le profil dispose" >&2
+    echo "  d'un fichier dans /etc/NetworkManager/system-connections/, puis relancez l'étape." >&2
+    return 1
   fi
+  if ! backup_file "$keyfile" "$STATE_DIR/nm-backups/$(basename "$keyfile").bak.${RUN_STAMP}"; then
+    log_err "Sauvegarde du profil « $con » impossible : profil non modifié."
+    return 1
+  fi
+  NET_NM_KEYFILE="$keyfile"
+  # La copie est inscrite dans l'état AVANT la modification : un retour arrière
+  # déclenché entre les deux saura la restaurer et la faire relire.
+  ecrire_etat_bascule || return 1
 
   if ! nmcli connection modify "$con" \
         ipv4.addresses "$cidr" \
@@ -1578,6 +1590,7 @@ write_nm_config() {
     return 1
   fi
   NET_NM_MODIFIED=1
+  ecrire_etat_bascule || return 1
 
   log_ok "Profil « $con » configuré en IP fixe (non appliqué pour l'instant)."
   return 0
@@ -1614,7 +1627,7 @@ configure_dns() {
     log_info "systemd-resolved est actif : configuration via resolved.conf.d."
     mkdir -p /etc/systemd/resolved.conf.d || return 1
     backup_file /etc/systemd/resolved.conf.d/90-personnalisation.conf || return 1
-    NET_GENERATED_FILES="$NET_GENERATED_FILES /etc/systemd/resolved.conf.d/90-personnalisation.conf"
+    declarer_fichier_genere /etc/systemd/resolved.conf.d/90-personnalisation.conf || return 1
     {
       echo "# Généré par le script de personnalisation Debian 13 le $(date)"
       echo "[Resolve]"
@@ -1625,7 +1638,13 @@ configure_dns() {
     # /etc/resolv.conf doit pointer sur le résolveur local, sinon les réglages
     # ci-dessus ne sont jamais consultés par les applications.
     if [[ "$(readlink -f /etc/resolv.conf 2>/dev/null)" != /run/systemd/resolve/* ]]; then
-      backup_file /etc/resolv.conf || return 1
+      # Sans fichier préexistant il n'y a rien à sauvegarder : le lien créé est
+      # alors déclaré comme généré, pour être retiré à l'annulation.
+      if [[ -e /etc/resolv.conf || -L /etc/resolv.conf ]]; then
+        backup_file /etc/resolv.conf || return 1
+      else
+        declarer_fichier_genere /etc/resolv.conf || return 1
+      fi
       ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || return 1
       log_ok "/etc/resolv.conf redirigé vers le résolveur systemd (127.0.0.53)."
     fi
@@ -1641,7 +1660,7 @@ configure_dns() {
     log_info "resolvconf est installé : il générera /etc/resolv.conf."
     if [[ -d /etc/resolvconf/resolv.conf.d ]]; then
       backup_file /etc/resolvconf/resolv.conf.d/head || return 1
-      NET_GENERATED_FILES="$NET_GENERATED_FILES /etc/resolvconf/resolv.conf.d/head"
+      declarer_fichier_genere /etc/resolvconf/resolv.conf.d/head || return 1
       {
         echo "# Généré par le script de personnalisation Debian 13"
         for srv in $dns; do echo "nameserver $srv"; done
@@ -1666,7 +1685,11 @@ configure_dns() {
     echo ""
   fi
 
-  backup_file /etc/resolv.conf || return 1
+  if [[ -e /etc/resolv.conf || -L /etc/resolv.conf ]]; then
+    backup_file /etc/resolv.conf || return 1
+  else
+    declarer_fichier_genere /etc/resolv.conf || return 1
+  fi
   rm -f /etc/resolv.conf
   build_resolv_conf /etc/resolv.conf "$dns" || return 1
   chmod 644 /etc/resolv.conf || return 1
@@ -1718,18 +1741,10 @@ configure_dns() {
 install_network_tools() {
   mkdir -p "$STATE_DIR" || return 1
 
-  # Un drapeau de confirmation laissé par une exécution PRÉCÉDENTE désarmerait
-  # immédiatement les garde-fous de la bascule qui commence. On repart de zéro.
-  rm -f "$CONFIRMED_FLAG" "$RUNTIME_CONFIRMED_FLAG"
-
-  # De même, une minuterie de retour arrière encore armée par une exécution
-  # précédente lirait le NOUVEL état partagé et pourrait défaire, plus tard et
-  # sans prévenir, la configuration qui s'écrit ici ; un retour arrière ou un
-  # garde-fou encore EN COURS modifierait les fichiers pendant qu'on les
-  # remplace. Tout est arrêté (« systemctl stop » attend la fin de l'unité)
-  # avant de toucher à l'état ; la bascule finale réarme sa propre minuterie.
-  systemctl stop ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-watchdog.service >/dev/null 2>&1 || true
-  systemctl reset-failed ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-appliquer.service ip-fixe-watchdog.service >/dev/null 2>&1 || true
+  # L'ORDRE COMPTE : d'abord les commandes et l'unité (leur contenu ne dépend pas
+  # de l'exécution), puis l'état partagé, et seulement ensuite le désarmement
+  # des garde-fous d'une exécution précédente. Ainsi, une bascule encore en
+  # attente reste protégée tant que son remplacement n'est pas prêt.
 
   # --- Bibliothèque commune ----------------------------------------------------
   cat > /usr/local/sbin/ip-fixe-commun <<'COMMON' || return 1
@@ -1860,15 +1875,31 @@ fi
 
 journal "AUCUNE CONFIRMATION REÇUE — restauration de la configuration réseau précédente."
 
-# 1. Suppression des fichiers créés par le script.
+echecs=0
+
+# 1. Suppression des fichiers créés par le script : liste figée dans l'état, et
+#    journal sur disque tenu à jour AVANT chaque création (il peut contenir un
+#    fichier créé après la dernière écriture de l'état).
+supprimer_genere() {
+  [ -n "${1:-}" ] || return 0
+  if ! rm -f "$1"; then
+    journal "ÉCHEC de suppression : $1"
+    echecs=$((echecs + 1))
+  fi
+}
 for f in ${NET_GENERATED_FILES:-}; do
-  [ -n "$f" ] && rm -f "$f"
+  supprimer_genere "$f"
 done
+if [ -n "${GENERATED_LIST:-}" ] && [ -r "$GENERATED_LIST" ]; then
+  while IFS= read -r f; do
+    supprimer_genere "$f"
+  done < "$GENERATED_LIST"
+fi
 
 # 2. Restauration des sauvegardes (l'état d'origine, donc le DHCP). La copie
 #    passe par un fichier temporaire (restaurer_fichier) : un échec ne supprime
-#    jamais l'original ; il est compté puis signalé.
-echecs=0
+#    jamais l'original ; il est compté puis signalé. Une sauvegarde absente est
+#    aussi un échec : le fichier reste alors en configuration IP fixe.
 if [ -r "${BACKUP_MANIFEST:-}" ]; then
   while IFS=$'\t' read -r orig sauvegarde; do
     [ -n "${orig:-}" ] || continue
@@ -1876,7 +1907,7 @@ if [ -r "${BACKUP_MANIFEST:-}" ]; then
     restaurer_fichier "$orig" "${sauvegarde:-}" || rc=$?
     case "$rc" in
       0) journal "Restauré : $orig" ;;
-      2) journal "Sauvegarde absente pour $orig (${sauvegarde:-aucune}) : fichier laissé tel quel." ;;
+      2) journal "ÉCHEC de restauration : $orig (sauvegarde absente : ${sauvegarde:-aucune})."; echecs=$((echecs + 1)) ;;
       *) journal "ÉCHEC de restauration : $orig (copie impossible)."; echecs=$((echecs + 1)) ;;
     esac
   done < "$BACKUP_MANIFEST"
@@ -1897,8 +1928,9 @@ if [ "${NET_STACK:-}" = "networkmanager" ]; then
     # Le fichier du profil d'origine vient d'être restauré à l'identique
     # (étape 2 ci-dessus) : NetworkManager doit simplement le relire.
     nmcli connection reload >/dev/null 2>&1
-  elif [ -n "${NET_NM_CONNECTION:-}" ]; then
-    # Pas de copie du profil : à défaut de mieux, on repasse en DHCP.
+  elif [ "${NET_NM_MODIFIED:-0}" = "1" ] && [ -n "${NET_NM_CONNECTION:-}" ]; then
+    # Profil réécrit sans copie disponible : à défaut de mieux, on repasse en
+    # DHCP. Jamais si le script n'a pas modifié le profil.
     nmcli connection modify "$NET_NM_CONNECTION" ipv4.method auto \
           ipv4.addresses "" ipv4.gateway "" ipv4.dns "" ipv4.ignore-auto-dns no >/dev/null 2>&1
   fi
@@ -2006,23 +2038,66 @@ RemainAfterExit=no
 WantedBy=multi-user.target
 UNIT
 
-  systemctl daemon-reload >/dev/null 2>&1 || return 1
-  systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1 || return 1
-
-  # Vérification finale : tout ce que les autres étapes et la documentation
-  # supposent présent doit l'être réellement.
+  # Vérification : tout ce que les autres étapes et la documentation supposent
+  # présent doit l'être réellement.
   local f
   for f in ip-fixe-commun ip-fixe-appliquer ip-fixe-rollback ip-fixe-confirmer ip-fixe-watchdog; do
     [[ -x "/usr/local/sbin/$f" ]] || return 1
   done
   [[ -f /etc/systemd/system/ip-fixe-watchdog.service ]] || return 1
 
-  # L'état partagé est écrit dès maintenant (rien de généré, manifeste vide) :
-  # les outils disposent ainsi d'un état cohérent à tout instant. Il est remis
-  # à jour après chaque phase d'écriture (voir ecrire_etat_bascule).
+  # L'état partagé est écrit (atomiquement) AVANT d'activer le garde-fou et de
+  # désarmer les anciens : à aucun moment un outil ne peut tourner sans état, ni
+  # avec l'état d'une exécution précédente. Il est remis à jour à chaque phase
+  # d'écriture (voir ecrire_etat_bascule).
   ecrire_etat_bascule || return 1
+
+  # Le remplacement est prêt : les garde-fous d'une exécution PRÉCÉDENTE sont
+  # désarmés maintenant seulement. Une minuterie encore armée lirait le nouvel
+  # état ; un retour arrière, un garde-fou ou une application encore EN COURS
+  # modifierait le réseau pendant qu'on le reconfigure (« systemctl stop »
+  # attend la fin de l'unité, « reset-failed » n'arrête rien). Le drapeau de
+  # confirmation de cette exécution précédente désarmerait immédiatement les
+  # nouveaux garde-fous : il est retiré.
+  systemctl stop ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-watchdog.service ip-fixe-appliquer.service >/dev/null 2>&1 || true
+  systemctl reset-failed ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-appliquer.service ip-fixe-watchdog.service >/dev/null 2>&1 || true
+  rm -f "$CONFIRMED_FLAG" "$RUNTIME_CONFIRMED_FLAG"
+
+  systemctl daemon-reload >/dev/null 2>&1 || return 1
+  systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1 || return 1
   log_ok "Garde-fou de démarrage installé (retour automatique au DHCP si le réseau ne répond pas)."
   return 0
+}
+
+################################################################################
+# FONCTION : Déclaration d'un fichier généré par l'étape réseau
+################################################################################
+# À appeler AVANT de créer le fichier : la liste en mémoire sert au script, le
+# journal sur disque sert aux outils de retour arrière si le script est
+# interrompu avant la mise à jour de l'état partagé.
+################################################################################
+declarer_fichier_genere() {
+  local f="${1:-}"
+  [[ -n "$f" ]] || return 1
+  NET_GENERATED_FILES="$NET_GENERATED_FILES $f"
+  if (( NET_BACKUP_MODE )); then
+    printf '%s\n' "$f" >> "$NET_GENERATED_LIST" || return 1
+  fi
+  return 0
+}
+
+################################################################################
+# FONCTION : Une bascule d'IP précédente est-elle encore sous surveillance ?
+################################################################################
+# Vrai si un état existe, n'a pas été confirmé, et qu'une minuterie de retour
+# arrière ou le garde-fou de démarrage est encore armé.
+################################################################################
+bascule_ip_en_attente() {
+  [[ -r "$ROLLBACK_STATE" ]] || return 1
+  [[ ! -e "$CONFIRMED_FLAG" && ! -e "$RUNTIME_CONFIRMED_FLAG" ]] || return 1
+  systemctl is-active --quiet ip-fixe-rollback.timer 2>/dev/null && return 0
+  systemctl is-enabled --quiet ip-fixe-watchdog.service 2>/dev/null && return 0
+  return 1
 }
 
 ################################################################################
@@ -2033,28 +2108,38 @@ UNIT
 # moment les fichiers générés et le manifeste des sauvegardes, pour qu'un retour
 # arrière déclenché entre deux phases ne restaure ni trop ni trop peu.
 ################################################################################
+# Les valeurs sont sérialisées avec « printf %q » (échappement shell réel) : un
+# nom de profil NetworkManager peut contenir une apostrophe, qui rendait le
+# fichier insourçable et faisait quitter le garde-fou sans rien restaurer. Le
+# fichier est écrit à côté puis remplacé par « mv » : une coupure en pleine
+# écriture ne laisse jamais un état tronqué.
 ecrire_etat_bascule() {
+  local tmp
   mkdir -p "$STATE_DIR" || return 1
-  cat > "$ROLLBACK_STATE" <<EOF || return 1
-# État de la bascule IP fixe — généré le $(date)
-NET_STACK='${NET_STACK}'
-NET_IFACE='${INTERFACE}'
-NET_CIDR='${STATIC_IP}'
-NET_IP='${STATIC_IP_BARE}'
-NET_GATEWAY='${GATEWAY}'
-NET_DNS='${DNS_SERVERS}'
-NET_NM_CONNECTION='${NET_NM_CONNECTION}'
-NET_NM_KEYFILE='${NET_NM_KEYFILE}'
-NET_IFUPDOWN_FILE='${NET_IFUPDOWN_FILE}'
-NET_GENERATED_FILES='${NET_GENERATED_FILES}'
-DHCPCD_NOHOOK_ADDED='${DHCPCD_NOHOOK_ADDED}'
-DNS_METHOD='${DNS_METHOD}'
-BACKUP_MANIFEST='${NET_BACKUP_MANIFEST}'
-CONFIRMED_FLAG='${CONFIRMED_FLAG}'
-RUNTIME_CONFIRMED_FLAG='${RUNTIME_CONFIRMED_FLAG}'
-TEST_DOMAINS='${NET_TEST_DOMAINS[*]}'
-EOF
-  chmod 600 "$ROLLBACK_STATE" || return 1
+  tmp="$(mktemp "$STATE_DIR/rollback.env.XXXXXX")" || return 1
+  {
+    echo "# État de la bascule IP fixe — généré le $(date)"
+    printf 'NET_STACK=%q\n'              "$NET_STACK"
+    printf 'NET_IFACE=%q\n'              "$INTERFACE"
+    printf 'NET_CIDR=%q\n'               "$STATIC_IP"
+    printf 'NET_IP=%q\n'                 "$STATIC_IP_BARE"
+    printf 'NET_GATEWAY=%q\n'            "$GATEWAY"
+    printf 'NET_DNS=%q\n'                "$DNS_SERVERS"
+    printf 'NET_NM_CONNECTION=%q\n'      "$NET_NM_CONNECTION"
+    printf 'NET_NM_KEYFILE=%q\n'         "$NET_NM_KEYFILE"
+    printf 'NET_NM_MODIFIED=%q\n'        "$NET_NM_MODIFIED"
+    printf 'NET_IFUPDOWN_FILE=%q\n'      "$NET_IFUPDOWN_FILE"
+    printf 'NET_GENERATED_FILES=%q\n'    "$NET_GENERATED_FILES"
+    printf 'GENERATED_LIST=%q\n'         "$NET_GENERATED_LIST"
+    printf 'DHCPCD_NOHOOK_ADDED=%q\n'    "$DHCPCD_NOHOOK_ADDED"
+    printf 'DNS_METHOD=%q\n'             "$DNS_METHOD"
+    printf 'BACKUP_MANIFEST=%q\n'        "$NET_BACKUP_MANIFEST"
+    printf 'CONFIRMED_FLAG=%q\n'         "$CONFIRMED_FLAG"
+    printf 'RUNTIME_CONFIRMED_FLAG=%q\n' "$RUNTIME_CONFIRMED_FLAG"
+    printf 'TEST_DOMAINS=%q\n'           "${NET_TEST_DOMAINS[*]}"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$ROLLBACK_STATE" || { rm -f "$tmp"; return 1; }
   return 0
 }
 
@@ -2067,7 +2152,7 @@ EOF
 # « restaurer » par-dessus une configuration déjà revenue à la normale.
 ################################################################################
 desinstaller_outils_reseau() {
-  systemctl stop ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-watchdog.service >/dev/null 2>&1 || true
+  systemctl stop ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-watchdog.service ip-fixe-appliquer.service >/dev/null 2>&1 || true
   systemctl disable ip-fixe-watchdog.service >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/ip-fixe-watchdog.service
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -2075,7 +2160,7 @@ desinstaller_outils_reseau() {
   rm -f /usr/local/sbin/ip-fixe-commun /usr/local/sbin/ip-fixe-appliquer \
         /usr/local/sbin/ip-fixe-rollback /usr/local/sbin/ip-fixe-confirmer \
         /usr/local/sbin/ip-fixe-watchdog
-  rm -f "$ROLLBACK_STATE" "$CONFIRMED_FLAG" "$RUNTIME_CONFIRMED_FLAG"
+  rm -f "$ROLLBACK_STATE" "$NET_GENERATED_LIST" "$CONFIRMED_FLAG" "$RUNTIME_CONFIRMED_FLAG"
   log_info "Outils de bascule retirés : aucune IP fixe n'est en attente."
   return 0
 }
@@ -2303,7 +2388,10 @@ sshd_restore_or_remove() {
         log_err "Aucune sauvegarde de /etc/ssh/sshd_config pour cette exécution : fichier laissé en place, à vérifier à la main."
         return 1
       fi
-      rm -f "$file"
+      if ! rm -f "$file"; then
+        log_err "Suppression de $file impossible : fichier laissé en place, à vérifier à la main."
+        return 1
+      fi
       return 0
       ;;
     *)
@@ -2854,23 +2942,10 @@ install_ssh_auth_tools() {
   [[ -n "$target" ]] || return 1
 
   mkdir -p "$STATE_DIR" || return 1
-  # Un drapeau laissé par une exécution précédente désarmerait immédiatement le
-  # garde-fou qui commence ; une minuterie encore armée par cette exécution
-  # précédente lirait le nouvel état et réactiverait le mot de passe plus tard,
-  # que le nouveau durcissement soit minuté ou non. On repart de zéro.
-  rm -f "$SSH_AUTH_CONFIRMED_FLAG"
-  systemctl stop ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
-  systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
 
-  cat > "$SSH_AUTH_STATE" <<EOF || return 1
-# État du durcissement SSH — généré le $(date)
-SSHD_TARGET='${target}'
-SSHD_TARGET_BACKUP='${target}.bak.${RUN_STAMP}'
-SSHD_MAIN_BACKUP='/etc/ssh/sshd_config.bak.${RUN_STAMP}'
-CONFIRMED_FLAG='${SSH_AUTH_CONFIRMED_FLAG}'
-EOF
-  chmod 600 "$SSH_AUTH_STATE" || return 1
-
+  # L'ORDRE COMPTE : les commandes d'abord, puis l'état, et seulement ensuite le
+  # désarmement d'un garde-fou précédent — qui reste ainsi en place tant que son
+  # remplacement n'est pas prêt.
   cat > /usr/local/sbin/ssh-cles-rollback <<'ROLLBACK' || return 1
 #!/bin/bash
 # Réactive l'authentification par mot de passe tant que le durcissement n'a pas
@@ -2954,11 +3029,38 @@ echo "  Pour la réactiver plus tard : sudo ssh-cles-rollback"
 exit 0
 CONFIRM
   chmod 755 /usr/local/sbin/ssh-cles-confirmer || return 1
+  [[ -x /usr/local/sbin/ssh-cles-rollback && -x /usr/local/sbin/ssh-cles-confirmer ]] || return 1
 
-  # Vérification finale : « set -e » n'étant pas actif, chaque écriture a été
-  # contrôlée ; on s'assure en plus que tout ce qui sera annoncé existe.
-  [[ -s "$SSH_AUTH_STATE" && -x /usr/local/sbin/ssh-cles-rollback && -x /usr/local/sbin/ssh-cles-confirmer ]] || return 1
+  # État écrit atomiquement (fichier à côté puis « mv ») avec un échappement
+  # shell réel des valeurs (« printf %q »).
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/ssh-auth.env.XXXXXX")" || return 1
+  {
+    echo "# État du durcissement SSH — généré le $(date)"
+    printf 'SSHD_TARGET=%q\n'        "$target"
+    printf 'SSHD_TARGET_BACKUP=%q\n' "${target}.bak.${RUN_STAMP}"
+    printf 'SSHD_MAIN_BACKUP=%q\n'   "/etc/ssh/sshd_config.bak.${RUN_STAMP}"
+    printf 'CONFIRMED_FLAG=%q\n'     "$SSH_AUTH_CONFIRMED_FLAG"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$SSH_AUTH_STATE" || { rm -f "$tmp"; return 1; }
+
+  # Le remplacement est prêt : une minuterie encore armée par une exécution
+  # précédente lirait le nouvel état et réactiverait le mot de passe plus tard,
+  # que le nouveau durcissement soit minuté ou non ; son drapeau de confirmation
+  # désarmerait le nouveau garde-fou. On repart de zéro.
+  systemctl stop ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
+  systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
+  rm -f "$SSH_AUTH_CONFIRMED_FLAG"
   return 0
+}
+
+################################################################################
+# FONCTION : Un durcissement SSH précédent est-il encore sous surveillance ?
+################################################################################
+durcissement_ssh_en_attente() {
+  [[ -r "$SSH_AUTH_STATE" && ! -e "$SSH_AUTH_CONFIRMED_FLAG" ]] || return 1
+  systemctl is-active --quiet ssh-cles-rollback.timer 2>/dev/null
 }
 
 ################################################################################
@@ -3823,6 +3925,21 @@ durcir_authentification() {
   cible="$(sshd_target_file)"
   bin="$(command -v sshd || echo /usr/sbin/sshd)"
 
+  # Un durcissement PRÉCÉDENT encore sous surveillance (minuterie armée, non
+  # confirmé) n'est pas écrasé en silence : son garde-fou serait désarmé au
+  # profit du nouveau. L'utilisateur tranche, et par défaut on n'y touche pas.
+  if durcissement_ssh_en_attente; then
+    echo ""
+    log_warn "Un durcissement SSH précédent attend encore sa confirmation (minuterie armée)."
+    echo "  Si votre connexion par clé fonctionne déjà : sudo ssh-cles-confirmer."
+    echo "  Sinon, laissez la minuterie réactiver le mot de passe, ou : sudo ssh-cles-rollback."
+    echo ""
+    if ! ask_yes_no "Remplacer ce durcissement en attente par un nouveau ?" "n"; then
+      log_info "Durcissement ignoré : le précédent reste sous surveillance."
+      return 0
+    fi
+  fi
+
   # Sauvegardes AVANT toute modification : sans elles, la restauration de secours
   # (sshd_restore_or_remove) ne saurait pas distinguer un fichier d'inclusion
   # préexistant d'un fichier créé ici, et pourrait supprimer le premier.
@@ -3957,6 +4074,13 @@ durcir_authentification() {
     log_err "Configuration invalide : restauration immédiate."
     sshd_restore_or_remove "$cible"
     ssh_reload_config || true
+    # La minuterie, si elle a été armée, réécrirait à son échéance le fichier
+    # tout juste restauré : elle est désarmée, il n'y a plus rien à défaire.
+    if (( SSH_AUTH_ROLLBACK_ARMED )); then
+      systemctl stop ssh-cles-rollback.timer >/dev/null 2>&1 || true
+      systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
+      SSH_AUTH_ROLLBACK_ARMED=0
+    fi
     SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
     return 1
   fi
@@ -4280,7 +4404,27 @@ echo "  4. La bascule réelle n'aura lieu qu'à la fin du script"
 echo "  5. Un retour automatique au DHCP est armé en cas de problème"
 echo ""
 
-if ask_yes_no "Souhaitez-vous configurer une IP fixe ?" "n"; then
+# Une bascule PRÉCÉDENTE encore sous surveillance (non confirmée, minuterie ou
+# garde-fou de démarrage armés) n'est pas écrasée en silence : ses garde-fous
+# seraient désarmés au profit des nouveaux. L'utilisateur tranche, et par défaut
+# on n'y touche pas.
+NET_STEP_ALLOWED=1
+if bascule_ip_en_attente; then
+  log_warn "Un changement d'adresse IP précédent attend encore sa confirmation."
+  echo "  Ses garde-fous (minuterie de retour arrière ou service de démarrage) sont"
+  echo "  toujours armés. Si cette session passe déjà par la nouvelle adresse :"
+  echo "    sudo ip-fixe-confirmer      (valider le changement précédent)"
+  echo "  Sinon :"
+  echo "    sudo ip-fixe-rollback       (revenir tout de suite en arrière)"
+  echo ""
+  if ! ask_yes_no "Remplacer ce changement en attente par une nouvelle configuration ?" "n"; then
+    log_info "Étape réseau ignorée : le changement précédent reste sous surveillance."
+    NET_STEP_ALLOWED=0
+  fi
+  echo ""
+fi
+
+if (( NET_STEP_ALLOWED )) && ask_yes_no "Souhaitez-vous configurer une IP fixe ?" "n"; then
   CONFIGURE_IP="y"
 
   DETECTED_IFACE="$(default_iface)"
@@ -4452,6 +4596,7 @@ if ask_yes_no "Souhaitez-vous configurer une IP fixe ?" "n"; then
     # des fichiers sans rapport avec la bascule en cours.
     mkdir -p "$STATE_DIR"
     : > "$NET_BACKUP_MANIFEST"
+    : > "$NET_GENERATED_LIST"
     NET_BACKUP_MODE=1
     NET_WRITE_OK=0
 
