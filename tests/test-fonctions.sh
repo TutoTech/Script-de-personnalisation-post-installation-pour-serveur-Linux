@@ -442,6 +442,13 @@ printf '%s\t%s\n' "$TMP_ANN/reecrit" "$TMP_ANN/reecrit.bak" > "$TMP_ANN/manifest
 NET_GENERATED_FILES="$TMP_ANN/reecrit"
 ok   "généré et sauvegardé : annulation réussie" annuler_ecriture_reseau
 egal "généré et sauvegardé : restauré, pas supprimé" "ancien" "$(cat "$TMP_ANN/reecrit")"
+# Manifeste illisible : sans lui, impossible de distinguer un fichier créé d'un
+# fichier préexistant réécrit ; l'annulation refuse et ne supprime rien.
+printf 'genere\n' > "$TMP_ANN/10-ens18"
+# shellcheck disable=SC2034
+NET_GENERATED_FILES="$TMP_ANN/10-ens18" NET_BACKUP_MANIFEST="$TMP_ANN/manifest-absent"
+ko   "manifeste illisible : annulation refusée" annuler_ecriture_reseau
+ok   "manifeste illisible : rien supprimé"      test -e "$TMP_ANN/10-ens18"
 rm -rf "$TMP_ANN"
 
 echo "== ask_input (entrée standard fermée) =="

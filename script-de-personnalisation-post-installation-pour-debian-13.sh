@@ -519,15 +519,20 @@ backup_file() {
   # Le manifeste est ce qui rend la sauvegarde EXPLOITABLE par le retour
   # arrière : s'il ne peut pas être écrit, la sauvegarde est réputée échouée et
   # l'appelant ne modifie rien.
-  if ! mkdir -p "$STATE_DIR" 2>/dev/null ||
-     ! printf '%s\t%s\n' "$src" "$dst" >> "$BACKUP_MANIFEST"; then
-    log_err "Impossible d'inscrire la sauvegarde de $src dans $BACKUP_MANIFEST"
+  if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+    log_err "Impossible de créer $STATE_DIR"
     return 1
   fi
   # Les fichiers sauvegardés pendant l'étape réseau sont en outre listés à part :
-  # ce sont les SEULS que le retour arrière automatique restaurera.
+  # ce sont les SEULS que le retour arrière automatique restaurera. Ce manifeste
+  # est écrit EN PREMIER : c'est lui que lit le garde-fou de démarrage, il ne
+  # doit jamais être en retard sur le manifeste général.
   if (( NET_BACKUP_MODE )) && ! printf '%s\t%s\n' "$src" "$dst" >> "$NET_BACKUP_MANIFEST"; then
     log_err "Impossible d'inscrire la sauvegarde de $src dans le manifeste réseau"
+    return 1
+  fi
+  if ! printf '%s\t%s\n' "$src" "$dst" >> "$BACKUP_MANIFEST"; then
+    log_err "Impossible d'inscrire la sauvegarde de $src dans $BACKUP_MANIFEST"
     return 1
   fi
   log_ok "Sauvegarde : $dst"
@@ -581,6 +586,27 @@ installer_fichier() {
   if [[ "$verif" == "bash" ]] && ! bash -n "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
   if ! chmod "$mode" "$tmp"; then rm -f "$tmp"; return 1; fi
   if ! mv -f "$tmp" "$dest"; then rm -f "$tmp"; return 1; fi
+  return 0
+}
+
+################################################################################
+# FONCTION : Arrêt vérifié d'unités systemd
+################################################################################
+# « systemctl stop » d'une unité inconnue ou déjà inactive renvoie un code non
+# nul sans que ce soit un problème ; à l'inverse, une unité qui refuse de
+# s'arrêter continuerait d'agir en parallèle. On n'arrête donc que les unités
+# actives, et on vérifie qu'elles le sont bien devenues.
+################################################################################
+arreter_unites() {
+  local u
+  for u in "$@"; do
+    systemctl is-active --quiet "$u" 2>/dev/null || continue
+    systemctl stop "$u" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "$u" 2>/dev/null; then
+      log_err "L'unité $u n'a pas pu être arrêtée."
+      return 1
+    fi
+  done
   return 0
 }
 
@@ -1947,7 +1973,14 @@ dans_manifeste() {
 #    (restaurer_fichier) : un échec ne supprime jamais l'original ; il est
 #    compté puis signalé. Une sauvegarde absente est aussi un échec : le fichier
 #    reste alors en configuration IP fixe.
-if [ -r "${BACKUP_MANIFEST:-}" ]; then
+#    Le manifeste existe toujours (créé, même vide, avant la première écriture) :
+#    illisible, il rend toute restauration impossible et, sans lui, on ne saurait
+#    pas distinguer un fichier créé d'un fichier préexistant réécrit. On ne
+#    supprime alors RIEN et le garde-fou est conservé.
+if [ ! -r "${BACKUP_MANIFEST:-}" ]; then
+  journal "ÉCHEC : manifeste des sauvegardes introuvable ou illisible (${BACKUP_MANIFEST:-non défini})."
+  echecs=$((echecs + 1))
+else
   while IFS=$'\t' read -r orig sauvegarde; do
     [ -n "${orig:-}" ] || continue
     rc=0
@@ -1963,7 +1996,7 @@ fi
 # 2. Suppression des fichiers CRÉÉS par le script — ceux qui n'ont pas de
 #    sauvegarde. Liste figée dans l'état, plus le journal sur disque tenu à
 #    jour AVANT chaque création (il peut contenir un fichier créé après la
-#    dernière écriture de l'état).
+#    dernière écriture de l'état). Rien n'est supprimé sans manifeste lisible.
 supprimer_genere() {
   [ -n "${1:-}" ] || return 0
   dans_manifeste "$1" && return 0
@@ -1972,13 +2005,15 @@ supprimer_genere() {
     echecs=$((echecs + 1))
   fi
 }
-for f in ${NET_GENERATED_FILES:-}; do
-  supprimer_genere "$f"
-done
-if [ -n "${GENERATED_LIST:-}" ] && [ -r "$GENERATED_LIST" ]; then
-  while IFS= read -r f; do
+if [ -r "${BACKUP_MANIFEST:-}" ]; then
+  for f in ${NET_GENERATED_FILES:-}; do
     supprimer_genere "$f"
-  done < "$GENERATED_LIST"
+  done
+  if [ -n "${GENERATED_LIST:-}" ] && [ -r "$GENERATED_LIST" ]; then
+    while IFS= read -r f; do
+      supprimer_genere "$f"
+    done < "$GENERATED_LIST"
+  fi
 fi
 if [ "$echecs" -gt 0 ]; then
   journal "ATTENTION : $echecs fichier(s) n'ont pas pu être restaurés, une intervention console est nécessaire."
@@ -1992,8 +2027,18 @@ fi
 # 4. Rechargement des démons concernés puis réapplication. Le résolveur relit
 #    sa configuration restaurée.
 case "${DNS_METHOD:-}" in
-  resolved)   systemctl restart systemd-resolved >/dev/null 2>&1 ;;
-  resolvconf) resolvconf -u >/dev/null 2>&1 ;;
+  resolved)
+    if ! systemctl restart systemd-resolved >/dev/null 2>&1; then
+      journal "ÉCHEC : systemd-resolved n'a pas relu sa configuration restaurée."
+      echecs=$((echecs + 1))
+    fi
+    ;;
+  resolvconf)
+    if ! resolvconf -u >/dev/null 2>&1; then
+      journal "ÉCHEC : resolvconf n'a pas régénéré /etc/resolv.conf."
+      echecs=$((echecs + 1))
+    fi
+    ;;
 esac
 systemctl daemon-reload >/dev/null 2>&1
 if [ "${NET_STACK:-}" = "networkmanager" ]; then
@@ -2005,9 +2050,11 @@ if [ "${NET_STACK:-}" = "networkmanager" ]; then
       journal "ÉCHEC : NetworkManager n'a pas relu le profil restauré."
       echecs=$((echecs + 1))
     fi
-  elif [ "${NET_NM_MODIFIED:-0}" = "1" ] && [ -n "${NET_NM_CONNECTION:-}" ]; then
+  elif [ "${NET_NM_MODIFIED:-1}" = "1" ] && [ -n "${NET_NM_CONNECTION:-}" ]; then
     # Profil réécrit sans copie disponible : à défaut de mieux, on repasse en
-    # DHCP. Jamais si le script n'a pas modifié le profil.
+    # DHCP. Jamais si le script n'a pas modifié le profil. Un état écrit par
+    # une version antérieure du script ne porte pas ce drapeau : il est alors
+    # tenu pour modifié, comme le faisait cette version.
     if ! nmcli connection modify "$NET_NM_CONNECTION" ipv4.method auto \
           ipv4.addresses "" ipv4.gateway "" ipv4.dns "" ipv4.ignore-auto-dns no >/dev/null 2>&1; then
       journal "ÉCHEC : le profil NetworkManager n'a pas pu être remis en DHCP."
@@ -2165,9 +2212,30 @@ UNIT
   # (« systemctl stop » attend la fin de l'unité, « reset-failed » n'arrête
   # rien). Le drapeau de confirmation de cette exécution précédente désarmerait
   # immédiatement les nouveaux garde-fous : il est retiré.
-  systemctl stop ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-watchdog.service ip-fixe-appliquer.service >/dev/null 2>&1 || true
+  arreter_unites ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-watchdog.service ip-fixe-appliquer.service || return 1
   systemctl reset-failed ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-appliquer.service ip-fixe-watchdog.service >/dev/null 2>&1 || true
   rm -f "$CONFIRMED_FLAG" "$RUNTIME_CONFIRMED_FLAG"
+
+  # Si l'ancien retour arrière s'est déclenché dans l'intervalle (quelques
+  # millisecondes), il a pu retirer l'unité du garde-fou : elle est réaffirmée.
+  if [[ ! -f /etc/systemd/system/ip-fixe-watchdog.service ]]; then
+    installer_fichier /etc/systemd/system/ip-fixe-watchdog.service 644 <<'UNIT2' || return 1
+[Unit]
+Description=Garde-fou IP fixe (retour automatique au DHCP si le réseau ne répond pas)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ip-fixe-watchdog
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
+UNIT2
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+  fi
+  systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1 || return 1
   log_ok "Garde-fou de démarrage installé (retour automatique au DHCP si le réseau ne répond pas)."
   return 0
 }
@@ -2284,15 +2352,20 @@ annuler_ecriture_reseau() {
   # Restauration D'ABORD : un fichier préexistant réécrit par le script est
   # remis en place, jamais effacé. Ne sont supprimés ensuite que les fichiers
   # générés SANS sauvegarde, c'est-à-dire créés par le script.
-  if [[ -r "$NET_BACKUP_MANIFEST" ]]; then
-    while IFS=$'\t' read -r orig sauvegarde; do
-      [[ -n "${orig:-}" && -n "${sauvegarde:-}" ]] || continue
-      if ! restore_file "$orig" "$sauvegarde"; then
-        log_err "Restauration de $orig impossible (sauvegarde : $sauvegarde)."
-        echecs=$((echecs + 1))
-      fi
-    done < "$NET_BACKUP_MANIFEST"
+  if [[ ! -r "$NET_BACKUP_MANIFEST" ]]; then
+    # Sans manifeste, impossible de restaurer ni de distinguer un fichier créé
+    # d'un fichier préexistant réécrit : on ne touche à rien, l'appelant garde
+    # le garde-fou en place.
+    log_err "Manifeste des sauvegardes réseau introuvable ou illisible ($NET_BACKUP_MANIFEST) : annulation impossible."
+    return 1
   fi
+  while IFS=$'\t' read -r orig sauvegarde; do
+    [[ -n "${orig:-}" && -n "${sauvegarde:-}" ]] || continue
+    if ! restore_file "$orig" "$sauvegarde"; then
+      log_err "Restauration de $orig impossible (sauvegarde : $sauvegarde)."
+      echecs=$((echecs + 1))
+    fi
+  done < "$NET_BACKUP_MANIFEST"
   for f in $NET_GENERATED_FILES; do
     [[ -n "$f" ]] || continue
     if [[ -r "$NET_BACKUP_MANIFEST" ]] &&
@@ -2302,8 +2375,18 @@ annuler_ecriture_reseau() {
     rm -f "$f" || echecs=$((echecs + 1))
   done
   case "$DNS_METHOD" in
-    resolved)   systemctl restart systemd-resolved >/dev/null 2>&1 || true ;;
-    resolvconf) resolvconf -u >/dev/null 2>&1 || true ;;
+    resolved)
+      if ! systemctl restart systemd-resolved >/dev/null 2>&1; then
+        log_err "systemd-resolved n'a pas relu sa configuration restaurée."
+        echecs=$((echecs + 1))
+      fi
+      ;;
+    resolvconf)
+      if ! resolvconf -u >/dev/null 2>&1; then
+        log_err "resolvconf n'a pas régénéré /etc/resolv.conf."
+        echecs=$((echecs + 1))
+      fi
+      ;;
   esac
   if [[ "$NET_STACK" == "networkmanager" ]]; then
     if [[ -n "$NET_NM_KEYFILE" ]]; then
@@ -3161,7 +3244,7 @@ CONFIRM
   # précédente lirait le nouvel état et réactiverait le mot de passe plus tard,
   # que le nouveau durcissement soit minuté ou non ; son drapeau de confirmation
   # désarmerait le nouveau garde-fou. On repart de zéro.
-  systemctl stop ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
+  arreter_unites ssh-cles-rollback.timer ssh-cles-rollback.service || return 1
   systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
   rm -f "$SSH_AUTH_CONFIRMED_FLAG"
   return 0
@@ -4735,17 +4818,24 @@ if (( NET_STEP_ALLOWED )) && ask_yes_no "Souhaitez-vous configurer une IP fixe ?
     # ce sont les seuls fichiers que le retour arrière restaurera. Le manifeste
     # est réinitialisé pour qu'une exécution précédente ne fasse pas restaurer
     # des fichiers sans rapport avec la bascule en cours.
-    mkdir -p "$STATE_DIR"
-    : > "$NET_BACKUP_MANIFEST"
-    : > "$NET_GENERATED_LIST"
-    NET_BACKUP_MODE=1
     NET_WRITE_OK=0
+    NET_JOURNAUX_OK=1
+    if ! mkdir -p "$STATE_DIR" || ! : > "$NET_BACKUP_MANIFEST" || ! : > "$NET_GENERATED_LIST"; then
+      NET_JOURNAUX_OK=0
+    fi
+    NET_BACKUP_MODE=1
 
     # Les outils de retour arrière et le garde-fou de démarrage sont installés
     # AVANT la première écriture : dès qu'un fichier est modifié, un redémarrage
     # ou une interruption du script sont couverts. S'ils ne peuvent pas l'être,
-    # rien n'est écrit : sans filet, une IP fixe serait un pari.
-    if ! install_network_tools; then
+    # pas plus que les journaux qu'ils lisent, rien n'est écrit : sans filet,
+    # une IP fixe serait un pari.
+    if (( ! NET_JOURNAUX_OK )); then
+      echo ""
+      log_err "Impossible de créer les journaux de retour arrière dans $STATE_DIR : étape réseau abandonnée, rien n'est écrit."
+      SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+      echo ""
+    elif ! install_network_tools; then
       echo ""
       log_err "Les outils de bascule et de retour arrière n'ont pas pu être installés."
       echo "  Sans garde-fou, appliquer une IP fixe serait un pari : rien n'est écrit,"
@@ -5102,14 +5192,16 @@ if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
     echo ""
     log_info "Vérification de la syntaxe de la configuration SSH..."
     SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
-    SSHD_TEST_LOG="$(mktemp)"
-    if "$SSHD_BIN" -t 2>"$SSHD_TEST_LOG"; then
+    # Sans fichier temporaire, le test tourne quand même : seuls les messages
+    # d'erreur ne seraient pas affichés.
+    SSHD_TEST_LOG="$(mktemp 2>/dev/null)" || SSHD_TEST_LOG=""
+    if "$SSHD_BIN" -t 2>"${SSHD_TEST_LOG:-/dev/null}"; then
         log_ok "Configuration SSH syntaxiquement valide."
         SSHD_VALID=1
     else
         SSHD_VALID=0
         log_err "La configuration SSH générée est INVALIDE :"
-        sed -e 's/^/    /' "$SSHD_TEST_LOG" >&2
+        [[ -n "$SSHD_TEST_LOG" ]] && sed -e 's/^/    /' "$SSHD_TEST_LOG" >&2
         echo ""
         log_warn "Restauration de la configuration précédente pour ne pas perdre l'accès SSH."
         if [[ "$SSHD_TARGET" != "/etc/ssh/sshd_config" ]]; then
@@ -5120,26 +5212,38 @@ if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
         restore_file /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.${RUN_STAMP}" || true
         SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
     fi
-    rm -f "$SSHD_TEST_LOG"
+    [[ -n "$SSHD_TEST_LOG" ]] && rm -f "$SSHD_TEST_LOG"
 
     if (( SSHD_VALID )); then
         # --- Application du port --------------------------------------------------
         if ssh_socket_active; then
             log_info "Application du port via la surcharge de ssh.socket..."
-            mkdir -p /etc/systemd/system/ssh.socket.d
-            backup_file /etc/systemd/system/ssh.socket.d/10-port.conf
-            cat > /etc/systemd/system/ssh.socket.d/10-port.conf <<EOF
+            # Sauvegarde exigée AVANT d'écrire, et écriture atomique : sans cela
+            # le port d'écoute pourrait changer sans surcharge restaurable.
+            SOCKET_OVERRIDE_OK=1
+            if ! mkdir -p /etc/systemd/system/ssh.socket.d ||
+               ! backup_file /etc/systemd/system/ssh.socket.d/10-port.conf; then
+                SOCKET_OVERRIDE_OK=0
+            elif ! installer_fichier /etc/systemd/system/ssh.socket.d/10-port.conf 644 <<EOF
 # Généré par le script de personnalisation Debian 13 le $(date)
-# Sur Debian 13, sshd est démarré par activation de socket : c'est ici, et non
-# dans sshd_config, que se choisit le port d'écoute.
+# Sur cette machine, sshd est démarré par activation de socket (ssh.socket) :
+# c'est ici, et non dans sshd_config, que se choisit le port d'écoute.
 [Socket]
 # La première ligne vide efface le port 22 hérité de l'unité d'origine.
 ListenStream=
 ListenStream=${SSH_PORT}
 EOF
-            systemctl daemon-reload
-            run_cmd "Redémarrage de ssh.socket..." systemctl restart ssh.socket || true
-            systemctl restart ssh.service >/dev/null 2>&1 || true
+            then
+                SOCKET_OVERRIDE_OK=0
+            fi
+            if (( SOCKET_OVERRIDE_OK )); then
+                systemctl daemon-reload
+                run_cmd "Redémarrage de ssh.socket..." systemctl restart ssh.socket || true
+                systemctl restart ssh.service >/dev/null 2>&1 || true
+            else
+                log_err "Surcharge de ssh.socket impossible (sauvegarde ou écriture) : le port d'écoute n'est pas modifié."
+                SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+            fi
         else
             run_cmd "Redémarrage du service SSH..." systemctl restart ssh || true
         fi
