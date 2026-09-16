@@ -576,18 +576,25 @@ temporaire_pour() {
 
 # installer_contenu <fichier> <temporaire>
 # Met en place un contenu préparé dans un temporaire de temporaire_pour : les
-# droits et le propriétaire de l'original sont reportés (un renommage ne les
-# transmet pas), puis « mv » remplace le fichier d'un coup. Une interruption ou
+# attributs de l'original (droits, propriétaire, attributs étendus dont les ACL
+# POSIX, contexte SELinux s'il existe) sont reportés — un renommage ne les
+# transmet pas —, puis « mv » remplace le fichier d'un coup. Une interruption ou
 # un disque plein ne laissent jamais le fichier tronqué, ce que pouvait faire
 # « cat temporaire > fichier ». Le temporaire est supprimé en cas d'échec.
 installer_contenu() {
   local file="${1:-}" tmp="${2:-}"
   [[ -n "$file" && -n "$tmp" && -f "$tmp" ]] || return 1
   if [[ -e "$file" ]]; then
-    if ! chmod --reference="$file" "$tmp" 2>/dev/null || ! chown --reference="$file" "$tmp" 2>/dev/null; then
-      rm -f "$tmp"
-      return 1
+    # « cp -a --attributes-only » recopie tous les attributs sans les données ;
+    # les horodatages sont ensuite rafraîchis, le contenu venant de changer. À
+    # défaut (cp trop ancien), droits et propriétaire au moins.
+    if ! cp -a --attributes-only -- "$file" "$tmp" 2>/dev/null; then
+      if ! chmod --reference="$file" "$tmp" 2>/dev/null || ! chown --reference="$file" "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+      fi
     fi
+    touch -- "$tmp" 2>/dev/null || true
   fi
   if ! mv -f "$tmp" "$file" 2>/dev/null; then
     rm -f "$tmp"
@@ -4863,14 +4870,28 @@ fi
 # simultanées écraseraient l'état l'une de l'autre, et un garde-fou pourrait
 # restaurer la configuration de l'autre. Le verrou (flock sur un descripteur)
 # est libéré à la fin du processus, quelle qu'en soit l'issue.
-LOCK_FILE="/run/lock/personnalisation-debian13.lock"
-if [[ ! -d /run/lock || ! -w /run/lock ]]; then
-  mkdir -p "$STATE_DIR" 2>/dev/null || true
-  LOCK_FILE="$STATE_DIR/verrou"
-fi
-if command -v flock >/dev/null 2>&1; then
-  exec 9>"$LOCK_FILE"
-  if ! flock -n 9; then
+# Ouverture du fichier de verrou : /run/lock, sinon le répertoire d'état. Si
+# aucun ne peut être ouvert, on continue SANS verrou, avec un avertissement : un
+# descripteur invalide ferait échouer « flock » et passerait, à tort, pour une
+# exécution concurrente. De même, seul le code de sortie réservé à la
+# contention (-E) est lu comme « déjà en cours » ; tout autre échec de flock
+# (système de fichiers sans verrous…) est un avertissement, pas un arrêt.
+LOCK_FILE=""
+for candidat in /run/lock/personnalisation-debian13.lock "$STATE_DIR/verrou"; do
+  mkdir -p "$(dirname "$candidat")" 2>/dev/null || true
+  if { exec 9>>"$candidat"; } 2>/dev/null; then
+    LOCK_FILE="$candidat"
+    break
+  fi
+done
+if [[ -z "$LOCK_FILE" ]]; then
+  echo "Avertissement : aucun fichier de verrou ne peut être ouvert (/run/lock, $STATE_DIR) : l'exclusion entre deux exécutions simultanées n'est pas assurée." >&2
+elif ! command -v flock >/dev/null 2>&1; then
+  echo "Avertissement : « flock » introuvable, l'exclusion entre deux exécutions simultanées n'est pas assurée." >&2
+else
+  LOCK_RC=0
+  flock -n -E 75 9 || LOCK_RC=$?
+  if (( LOCK_RC == 75 )); then
     echo "=========================================="
     echo "  ERREUR : EXÉCUTION DÉJÀ EN COURS"
     echo "=========================================="
@@ -4879,9 +4900,9 @@ if command -v flock >/dev/null 2>&1; then
     echo "Attendez qu'elle se termine (ou vérifiez avec « ps aux | grep $(basename "$0") »)."
     echo ""
     exit 1
+  elif (( LOCK_RC != 0 )); then
+    echo "Avertissement : verrou $LOCK_FILE impossible à poser (flock, code $LOCK_RC) : l'exclusion entre deux exécutions simultanées n'est pas assurée." >&2
   fi
-else
-  echo "Avertissement : « flock » introuvable, l'exclusion entre deux exécutions simultanées n'est pas assurée." >&2
 fi
 
 detect_os

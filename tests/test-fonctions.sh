@@ -202,7 +202,7 @@ egal "droits conservés"                      "640" "$(stat -c '%a' "$TMP_RCD/rc
 ok   "le lien symbolique est resté un lien"  test -L "$TMP_RCD/lien"
 egal "le fichier visé porte le bloc"         "1" "$(grep -c '^via le lien$' "$TMP_RCD/rc")"
 # shellcheck disable=SC2012
-egal "aucun temporaire laissé"               "lien rc" "$(ls -A "$TMP_RCD" | sort | tr '\n' ' ' | sed 's/ $//')"
+egal "aucun temporaire laissé"               "lien rc" "$(ls -A "$TMP_RCD" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
 rm -rf "$TMP_RCD"
 
 # Lien symbolique irrésoluble (répertoire cible absent) : refusé, rien n'est écrit.
@@ -516,8 +516,10 @@ ok "ens19 mentionnée"                    ifupdown_file_mentions_iface "$TMP_IF"
 ko "ens20 absente"                       ifupdown_file_mentions_iface "$TMP_IF" ens20
 ko "« ens1 » n'est pas un préfixe de ens18" ifupdown_file_mentions_iface "$TMP_IF" ens1
 chmod 640 "$TMP_IF"
+touch -d '2020-01-01 00:00:00' "$TMP_IF"
 ok   "strip renvoie 0"                   ifupdown_strip_iface_stanzas "$TMP_IF" ens18
 egal "droits conservés (réécriture atomique)" "640" "$(stat -c '%a' "$TMP_IF")"
+ok   "horodatage rafraîchi (le contenu a changé)" test "$(stat -c '%Y' "$TMP_IF")" -gt 1600000000
 egal "aucun temporaire laissé dans le répertoire" "interfaces" "$(ls -A "$TMP_IFD")"
 egal "strophe iface ens18 inet retirée"  "0" "$(grep -c '^iface ens18 inet ' "$TMP_IF")"
 egal "options de la strophe retirées"    "0" "$(grep -c 'metric 100' "$TMP_IF")"
@@ -551,7 +553,7 @@ ok   "via un lien : strip renvoie 0"            ifupdown_strip_iface_stanzas "$T
 ok   "via un lien : le lien est resté un lien"  test -L "$TMP_IFD/lien"
 egal "via un lien : cible réécrite"             "iface lo inet loopback" "$(cat "$TMP_IFD/interfaces")"
 # shellcheck disable=SC2012
-egal "via un lien : aucun temporaire laissé"    "interfaces lien" "$(ls -A "$TMP_IFD" | sort | tr '\n' ' ' | sed 's/ $//')"
+egal "via un lien : aucun temporaire laissé"    "interfaces lien" "$(ls -A "$TMP_IFD" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
 rm -rf "$TMP_IFD"
 
 echo "== ecrire_etat_bascule / declarer_fichier_genere =="
