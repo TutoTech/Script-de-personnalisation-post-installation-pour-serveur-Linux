@@ -256,6 +256,17 @@ ko   "répertoire d'état impossible : échec"                  backup_file "$TM
 ko   "répertoire d'état impossible : aucune copie orpheline" test -e "$TMP_BF/conf.bak.$RUN_STAMP"
 rm -rf "$TMP_BF"
 
+echo "== resoudre_lien =="
+TMP_RL="$(mktemp -d)"
+printf 'x\n' > "$TMP_RL/fichier"
+ln -s "$TMP_RL/fichier" "$TMP_RL/lien"
+ln -s "$TMP_RL/inexistant/cible" "$TMP_RL/lien-casse"
+egal "fichier ordinaire : lui-même"          "$TMP_RL/fichier" "$(resoudre_lien "$TMP_RL/fichier")"
+egal "lien symbolique : sa cible"            "$TMP_RL/fichier" "$(resoudre_lien "$TMP_RL/lien")"
+ko   "lien irrésoluble : échec"              resoudre_lien "$TMP_RL/lien-casse"
+ko   "argument vide : échec"                 resoudre_lien ""
+rm -rf "$TMP_RL"
+
 echo "== restore_file / sshd_restore_or_remove =="
 # La copie passe par un fichier temporaire : un échec ne supprime jamais
 # l'original. Codes : 0 restauré, 2 sauvegarde absente, 1 copie en échec.
@@ -531,6 +542,18 @@ egal "IPv6 seule : allow-hotplug conservé" "1" "$(grep -c '^allow-hotplug ens18
 egal "IPv6 seule : strophe inet6 conservée" "1" "$(grep -c '^iface ens18 inet6 auto$' "$TMP_IF")"
 rm -f "$TMP_IF"
 
+# Fichier atteint par un lien symbolique : le lien reste un lien, c'est sa cible
+# qui est réécrite (un « mv » sur le lien l'aurait remplacé par un fichier).
+TMP_IFD="$(mktemp -d)"
+printf 'allow-hotplug ens18\niface ens18 inet dhcp\niface lo inet loopback\n' > "$TMP_IFD/interfaces"
+ln -s "$TMP_IFD/interfaces" "$TMP_IFD/lien"
+ok   "via un lien : strip renvoie 0"            ifupdown_strip_iface_stanzas "$TMP_IFD/lien" ens18
+ok   "via un lien : le lien est resté un lien"  test -L "$TMP_IFD/lien"
+egal "via un lien : cible réécrite"             "iface lo inet loopback" "$(cat "$TMP_IFD/interfaces")"
+# shellcheck disable=SC2012
+egal "via un lien : aucun temporaire laissé"    "interfaces lien" "$(ls -A "$TMP_IFD" | sort | tr '\n' ' ' | sed 's/ $//')"
+rm -rf "$TMP_IFD"
+
 echo "== ecrire_etat_bascule / declarer_fichier_genere =="
 # L'état partagé doit rester sourçable quelles que soient les valeurs (un nom de
 # profil NetworkManager peut contenir une apostrophe) et être écrit en 600.
@@ -802,6 +825,94 @@ egal "avec écriture : fichier restauré"                 "dhcp" "$(cat "$TMP_RB
 ok   "avec écriture : pile réappliquée (ifup)"          grep -q '^ifup ens18' "$TMP_RB/appels"
 ko   "avec écriture : unité du garde-fou retirée aussi" test -e "$TMP_RB/watchdog.service"
 rm -rf "$TMP_RB"
+
+echo "== ip-fixe-confirmer / ssh-cles-confirmer (drapeau écrit avant désarmement) =="
+# Sans drapeau écrit, rien n'atteste la confirmation : la minuterie et les
+# garde-fous doivent rester en place et l'outil échouer.
+TMP_CF="$(mktemp -d)"
+mkdir -p "$TMP_CF/bin" "$TMP_CF/etat"
+for c in systemctl logger; do
+  # shellcheck disable=SC2016
+  printf '#!/bin/bash\nprintf "%%s\\n" "%s $*" >> "%s/appels"\nexit 0\n' "$c" "$TMP_CF" > "$TMP_CF/bin/$c"
+  chmod 755 "$TMP_CF/bin/$c"
+done
+sed -e "s|^STATE_FILE=.*|STATE_FILE=\"$TMP_CF/etat/rollback.env\"|" "$TMP_COMMON" > "$TMP_CF/commun"
+awk "/ip-fixe-confirmer 755 bash <<'CONFIRM'/ { on = 1; next } /^CONFIRM\$/ { on = 0 } on" "$CIBLE" |
+  sed -e "s|^\. /usr/local/sbin/ip-fixe-commun\$|. $TMP_CF/commun|" \
+      -e "s|/etc/systemd/system/ip-fixe-watchdog.service|$TMP_CF/watchdog.service|g" > "$TMP_CF/ip-fixe-confirmer"
+awk "/ssh-cles-confirmer 755 bash <<'CONFIRM'/ { on = 1; next } /^CONFIRM\$/ { on = 0 } on" "$CIBLE" |
+  sed -e "s|^STATE_FILE=.*|STATE_FILE=\"$TMP_CF/etat/ssh-auth.env\"|" \
+      -e "s|^FLAG=.*|FLAG=\"$TMP_CF/etat/ssh-auth-confirmed\"|" > "$TMP_CF/ssh-cles-confirmer"
+ok "ip-fixe-confirmer extrait et analysable"   bash -n "$TMP_CF/ip-fixe-confirmer"
+ok "ssh-cles-confirmer extrait et analysable"  bash -n "$TMP_CF/ssh-cles-confirmer"
+printf 'x\n' > "$TMP_CF/pas-un-dossier"
+etat_confirm() {  # $1 = drapeau persistant
+  printf 'NET_STACK=ifupdown\nNET_IFACE=ens18\nNET_CIDR=10.0.0.2/24\nBACKUP_MANIFEST=%q\nNET_NM_MODIFIED=0\nCONFIRMED_FLAG=%q\nRUNTIME_CONFIRMED_FLAG=%q\n' \
+    "$TMP_CF/etat/manifest" "$1" "$TMP_CF/etat/confirmed.run" > "$TMP_CF/etat/rollback.env"
+  printf 'SSHD_TARGET=/etc/ssh/sshd_config\nCONFIRMED_FLAG=%q\n' "$1" > "$TMP_CF/etat/ssh-auth.env"
+}
+outil_cf() {  # $1 = outil
+  rm -f "$TMP_CF/appels"
+  # shellcheck disable=SC2030,SC2031
+  ( PATH="$TMP_CF/bin:$PATH"; bash "$TMP_CF/$1" >/dev/null 2>&1 )
+}
+etat_confirm "$TMP_CF/pas-un-dossier/sous/confirmed"
+ko "ip-fixe-confirmer : drapeau inscriptible impossible → échec"     outil_cf ip-fixe-confirmer
+ko "ip-fixe-confirmer : minuterie et garde-fou conservés"           grep -q '^systemctl stop\|^systemctl disable' "$TMP_CF/appels"
+ko "ssh-cles-confirmer : drapeau inscriptible impossible → échec"    outil_cf ssh-cles-confirmer
+ko "ssh-cles-confirmer : minuterie conservée"                        grep -q '^systemctl stop' "$TMP_CF/appels"
+etat_confirm "$TMP_CF/etat/confirmed"
+ok "ip-fixe-confirmer : succès"                                      outil_cf ip-fixe-confirmer
+ok "ip-fixe-confirmer : drapeau écrit"                               test -e "$TMP_CF/etat/confirmed"
+ok "ip-fixe-confirmer : minuterie désarmée"                          grep -q '^systemctl stop ip-fixe-rollback.timer' "$TMP_CF/appels"
+rm -f "$TMP_CF/etat/confirmed"
+ok "ssh-cles-confirmer : succès"                                     outil_cf ssh-cles-confirmer
+ok "ssh-cles-confirmer : drapeau écrit"                              test -e "$TMP_CF/etat/confirmed"
+ok "ssh-cles-confirmer : minuterie désarmée"                         grep -q '^systemctl stop ssh-cles-rollback.timer' "$TMP_CF/appels"
+rm -rf "$TMP_CF"
+
+echo "== ssh-cles-rollback (outil généré) : repli sur la copie de référence =="
+# sshd est doublé : « -t » échoue à la demande (configuration invalide après la
+# réécriture) et « -T » annonce le mot de passe accepté. Le repli doit remettre la
+# copie de référence en place (temporaire puis « mv », rien de tronqué), ou
+# supprimer un fichier qui n'existait pas avant le durcissement (marqueur).
+TMP_SR="$(mktemp -d)"
+mkdir -p "$TMP_SR/bin" "$TMP_SR/etat" "$TMP_SR/ssh"
+for c in systemctl logger; do
+  printf '#!/bin/bash\nexit 0\n' > "$TMP_SR/bin/$c"
+  chmod 755 "$TMP_SR/bin/$c"
+done
+# shellcheck disable=SC2016
+printf '#!/bin/bash\ncase "$1" in\n  -t) [ ! -e "%s/sshd-invalide" ] ;;\n  -T) echo "passwordauthentication yes" ;;\n  *) exit 0 ;;\nesac\n' "$TMP_SR" > "$TMP_SR/bin/sshd"
+chmod 755 "$TMP_SR/bin/sshd"
+awk "/ssh-cles-rollback 755 bash <<'ROLLBACK'/ { on = 1; next } /^ROLLBACK\$/ { on = 0 } on" "$CIBLE" |
+  sed -e "s|^STATE_FILE=.*|STATE_FILE=\"$TMP_SR/etat/ssh-auth.env\"|" > "$TMP_SR/ssh-cles-rollback"
+ok "ssh-cles-rollback extrait et analysable"   bash -n "$TMP_SR/ssh-cles-rollback"
+CIBLE_SR="$TMP_SR/ssh/99-personnalisation.conf"
+REF_SR="$CIBLE_SR.avant-durcissement.test"
+printf 'SSHD_TARGET=%q\nSSHD_TARGET_BACKUP=%q\nCONFIRMED_FLAG=%q\n' "$CIBLE_SR" "$REF_SR" "$TMP_SR/etat/confirmed" > "$TMP_SR/etat/ssh-auth.env"
+rollback_ssh() {
+  # shellcheck disable=SC2030,SC2031
+  ( PATH="$TMP_SR/bin:$PATH"; bash "$TMP_SR/ssh-cles-rollback" >/dev/null 2>&1 )
+}
+# Configuration valide après réécriture : directives posées, pas de repli.
+printf 'Port 2222\nPasswordAuthentication no\n' > "$CIBLE_SR"
+printf 'Port 2222\n' > "$REF_SR"
+ok   "configuration valide : succès"                         rollback_ssh
+egal "configuration valide : mot de passe réactivé dans le fichier" "1" "$(grep -c '^PasswordAuthentication yes$' "$CIBLE_SR")"
+egal "configuration valide : copie de référence intacte"      "Port 2222" "$(cat "$REF_SR")"
+# Configuration invalide : copie de référence remise en place.
+printf 'Port 2222\nPasswordAuthentication no\n' > "$CIBLE_SR"
+: > "$TMP_SR/sshd-invalide"
+ok   "configuration invalide : succès"                        rollback_ssh
+egal "configuration invalide : copie de référence remise"     "Port 2222" "$(cat "$CIBLE_SR")"
+egal "configuration invalide : aucun temporaire laissé"       "0" "$(find "$TMP_SR/ssh" -name '.*' | wc -l)"
+# Fichier absent avant le durcissement (marqueur) : supprimé, pas restauré.
+rm -f "$REF_SR" "$CIBLE_SR"
+: > "$REF_SR.absent"
+ok   "marqueur d'absence : succès"                            rollback_ssh
+ko   "marqueur d'absence : fichier créé par le durcissement supprimé" test -e "$CIBLE_SR"
+rm -rf "$TMP_SR"
 rm -rf "$TMP_COMMON" "$TMP_BIN"
 
 echo "== run_cmd (propagation du code retour) =="

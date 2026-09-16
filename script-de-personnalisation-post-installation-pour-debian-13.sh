@@ -596,6 +596,23 @@ installer_contenu() {
   return 0
 }
 
+# resoudre_lien <fichier>
+# Imprime le fichier visé si <fichier> est un lien symbolique (le lien reste en
+# place : c'est sa cible qui sera réécrite, comme le faisait une écriture « > »
+# à travers lui), <fichier> lui-même sinon. Échoue si le lien ne peut pas être
+# résolu (répertoire cible absent) : mieux vaut ne rien écrire que n'importe où.
+resoudre_lien() {
+  local file="${1:-}" cible
+  [[ -n "$file" ]] || return 1
+  if [[ ! -L "$file" ]]; then
+    printf '%s' "$file"
+    return 0
+  fi
+  cible="$(readlink -f -- "$file" 2>/dev/null)" || return 1
+  [[ -n "$cible" ]] || return 1
+  printf '%s' "$cible"
+}
+
 # restore_file <fichier> <sauvegarde>
 # Renvoie 0 si la restauration a réussi, 2 si la sauvegarde n'existe pas, 1 si
 # la copie a échoué. La copie passe par un fichier temporaire (temporaire_pour)
@@ -678,21 +695,17 @@ arreter_unites() {
 ################################################################################
 write_marked_block() {
   local file="${1:-}" begin="${2:-}" end="${3:-}"
-  local content tmp n_begin n_end
+  local content tmp n_begin n_end cible
 
   content="$(cat)"
   [[ -n "$file" ]] || return 1
   # Un lien symbolique (fichier de démarrage géré ailleurs) est suivi : c'est le
-  # fichier visé qui est réécrit, le lien reste en place. Un lien impossible à
-  # résoudre (répertoire cible absent) est refusé plutôt que d'écrire n'importe où.
-  if [[ -L "$file" ]]; then
-    local cible
-    if ! cible="$(readlink -f -- "$file")" || [[ -z "$cible" ]]; then
-      log_err "Lien symbolique irrésoluble : $file (rien n'est écrit)."
-      return 1
-    fi
-    file="$cible"
+  # fichier visé qui est réécrit, le lien reste en place (resoudre_lien).
+  if ! cible="$(resoudre_lien "$file")"; then
+    log_err "Lien symbolique irrésoluble : $file (rien n'est écrit)."
+    return 1
   fi
+  file="$cible"
   [[ -e "$file" ]] || touch "$file" || return 1
 
   n_begin="$(grep -nF -m1 -- "$begin" "$file" 2>/dev/null | cut -d: -f1)"
@@ -1479,8 +1492,15 @@ ifupdown_file_mentions_iface() {
 }
 
 ifupdown_strip_iface_stanzas() {
-  local file="${1:-}" iface="${2:-}" tmp
+  local file="${1:-}" iface="${2:-}" tmp cible
   [[ -f "$file" && -n "$iface" ]] || return 1
+  # Un lien symbolique est suivi : c'est le fichier visé qui est réécrit, le
+  # lien reste en place (un « mv » sur le lien l'aurait remplacé par un fichier).
+  if ! cible="$(resoudre_lien "$file")" || [[ ! -f "$cible" ]]; then
+    log_err "Lien symbolique irrésoluble : $file (rien n'est modifié)."
+    return 1
+  fi
+  file="$cible"
   tmp="$(temporaire_pour "$file")" || return 1
   # Deux lectures du même fichier : la première cherche une strophe IPv4 de la
   # carte ; sans elle, RIEN n'est retiré, pas même « auto »/« allow-hotplug »,
@@ -2250,9 +2270,13 @@ set -u
 . /usr/local/sbin/ip-fixe-commun
 charger_etat || exit 1
 
-mkdir -p "$(dirname "${CONFIRMED_FLAG}")"
-touch "${CONFIRMED_FLAG}"
-touch "${RUNTIME_CONFIRMED_FLAG}"
+# Le drapeau persistant est écrit AVANT de désarmer les garde-fous : sans lui,
+# rien n'atteste la confirmation, et les garde-fous restent le dernier filet.
+if ! mkdir -p "$(dirname "${CONFIRMED_FLAG}")" 2>/dev/null || ! touch "${CONFIRMED_FLAG}" 2>/dev/null; then
+  journal "ÉCHEC de la confirmation : le drapeau ${CONFIRMED_FLAG} n'a pas pu être écrit, garde-fous conservés."
+  exit 1
+fi
+touch "${RUNTIME_CONFIRMED_FLAG}" 2>/dev/null || journal "Avertissement : drapeau volatile ${RUNTIME_CONFIRMED_FLAG} non écrit (le drapeau persistant suffit)."
 
 systemctl stop ip-fixe-rollback.timer >/dev/null 2>&1
 systemctl stop ip-fixe-rollback.service >/dev/null 2>&1
@@ -3496,8 +3520,30 @@ if ! "$SSHD_BIN" -t 2>/dev/null; then
   # Seul le fichier visé a été réécrit : lui seul est ramené à sa copie de
   # référence, prise juste avant le durcissement — et non la copie de
   # l'exécution, antérieure aux réglages de l'étape 7 (port, accès root).
+  # Un marqueur « .absent » signifie que le fichier n'existait pas avant le
+  # durcissement : il est supprimé, pas restauré (jamais le fichier principal).
+  # La copie passe par un temporaire du même répertoire puis « mv » : un échec
+  # laisse le fichier tel quel et est signalé, jamais un fichier tronqué.
   journal "Configuration invalide après réécriture : retour à la copie de référence du durcissement."
-  [ -e "${SSHD_TARGET_BACKUP:-}" ] && cp -a "$SSHD_TARGET_BACKUP" "$SSHD_TARGET"
+  if [ -e "${SSHD_TARGET_BACKUP:-}.absent" ]; then
+    if [ "$SSHD_TARGET" = "/etc/ssh/sshd_config" ]; then
+      journal "ÉCHEC : /etc/ssh/sshd_config sans copie de référence, fichier laissé en place, à vérifier à la console (sshd -t)."
+    elif rm -f "$SSHD_TARGET" 2>/dev/null; then
+      journal "Fichier $SSHD_TARGET supprimé : il n'existait pas avant le durcissement."
+    else
+      journal "ÉCHEC : $SSHD_TARGET n'a pas pu être supprimé, à vérifier à la console."
+    fi
+  elif [ -e "${SSHD_TARGET_BACKUP:-}" ]; then
+    tmp="$(mktemp "$(dirname -- "$SSHD_TARGET")/.$(basename -- "$SSHD_TARGET").XXXXXX" 2>/dev/null)" || tmp=""
+    if [ -n "$tmp" ] && cp -a "$SSHD_TARGET_BACKUP" "$tmp" 2>/dev/null && mv -f "$tmp" "$SSHD_TARGET" 2>/dev/null; then
+      journal "Copie de référence remise en place : $SSHD_TARGET"
+    else
+      [ -n "$tmp" ] && rm -f "$tmp" 2>/dev/null
+      journal "ÉCHEC : la copie de référence n'a pas pu être remise en place, $SSHD_TARGET est à vérifier à la console (sshd -t)."
+    fi
+  else
+    journal "ÉCHEC : aucune copie de référence pour $SSHD_TARGET, fichier laissé en place, à vérifier à la console (sshd -t)."
+  fi
 fi
 
 if systemctl is-active --quiet ssh.service 2>/dev/null; then
@@ -3526,8 +3572,13 @@ if [ -r "$STATE_FILE" ]; then
   FLAG="${CONFIRMED_FLAG:-$FLAG}"
 fi
 
-mkdir -p "$(dirname "$FLAG")"
-: > "$FLAG"
+# Le drapeau est écrit AVANT de désarmer la minuterie : sans lui, rien n'atteste
+# la confirmation, et la minuterie reste le dernier filet.
+if ! mkdir -p "$(dirname "$FLAG")" 2>/dev/null || ! { : > "$FLAG"; } 2>/dev/null; then
+  echo "✗ Impossible d'écrire le drapeau de confirmation ($FLAG) : la minuterie de retour reste armée." >&2
+  logger -t ssh-cles "ÉCHEC de la confirmation : drapeau $FLAG non écrit, minuterie conservée." 2>/dev/null
+  exit 1
+fi
 systemctl stop ssh-cles-rollback.timer >/dev/null 2>&1
 systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1
 logger -t ssh-cles "Durcissement SSH confirmé par l'administrateur." 2>/dev/null
@@ -4997,17 +5048,26 @@ if [[ -n "$NEW_HOSTNAME" ]]; then
     else
       log_info "Mise à jour du fichier /etc/hosts..."
       # Réécriture par awk : le nom n'est jamais interprété comme une expression
-      # régulière ni comme une chaîne de remplacement sed.
-      HOSTS_TMP="$(mktemp)"
-      if ! awk -v h="$NEW_HOSTNAME" '
-          $1 == "127.0.1.1" { print "127.0.1.1\t" h; done = 1; next }
-          { print }
-          END { if (!done) print "127.0.1.1\t" h }
-        ' /etc/hosts > "$HOSTS_TMP" || ! cat "$HOSTS_TMP" > /etc/hosts; then
+      # régulière ni comme une chaîne de remplacement sed. Le nouveau contenu est
+      # préparé dans un temporaire du même répertoire puis mis en place d'un coup
+      # (installer_contenu) : une interruption ou un disque plein ne laissent
+      # jamais /etc/hosts tronqué. Un lien symbolique est suivi.
+      HOSTS_OK=0
+      if HOSTS_FILE="$(resoudre_lien /etc/hosts)" && HOSTS_TMP="$(temporaire_pour "$HOSTS_FILE")"; then
+        if awk -v h="$NEW_HOSTNAME" '
+            $1 == "127.0.1.1" { print "127.0.1.1\t" h; done = 1; next }
+            { print }
+            END { if (!done) print "127.0.1.1\t" h }
+          ' "$HOSTS_FILE" > "$HOSTS_TMP" && installer_contenu "$HOSTS_FILE" "$HOSTS_TMP"; then
+          HOSTS_OK=1
+        else
+          rm -f "$HOSTS_TMP"
+        fi
+      fi
+      if (( ! HOSTS_OK )); then
         log_err "Mise à jour de /etc/hosts impossible : vérifiez la ligne « 127.0.1.1 $NEW_HOSTNAME »."
         SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
       fi
-      rm -f "$HOSTS_TMP"
     fi
     echo ""
     log_ok "Hostname configuré : $NEW_HOSTNAME"
