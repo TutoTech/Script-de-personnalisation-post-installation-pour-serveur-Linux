@@ -1906,6 +1906,16 @@ appliquer_pile() {
       networkctl reconfigure "$NET_IFACE" >/dev/null 2>&1
       ;;
     networkmanager)
+      # L'état est publié dès l'installation des outils, AVANT que le profil ne
+      # soit repéré (write_nm_config) : un retour arrière déclenché dans cet
+      # intervalle (redémarrage, coupure) lit un profil vide. Rien n'a alors
+      # été écrit, il n'y a donc rien à réappliquer : cas sans opération, et
+      # non « nmcli connection up "" », qui échouerait et ferait tenir le
+      # retour pour incomplet à chaque démarrage.
+      if [ -z "${NET_NM_CONNECTION:-}" ]; then
+        journal "Aucun profil NetworkManager enregistré dans l'état : rien à appliquer."
+        return 0
+      fi
       nmcli connection up "$NET_NM_CONNECTION"
       ;;
     *)
@@ -2222,8 +2232,12 @@ UNIT
 
   # L'état partagé est publié (atomiquement) : les outils disposent d'un état
   # cohérent à tout instant. Il est remis à jour à chaque phase d'écriture
-  # (voir ecrire_etat_bascule). Le drapeau de confirmation de l'exécution
-  # précédente désarmerait immédiatement les nouveaux garde-fous : retiré.
+  # (voir ecrire_etat_bascule). Publié avant toute écriture, il est sans effet
+  # pour les outils : manifeste vide (rien à restaurer), aucun fichier généré
+  # (rien à supprimer) et, sous NetworkManager, aucun profil (rien à
+  # réappliquer, voir appliquer_pile). Le drapeau de confirmation de
+  # l'exécution précédente désarmerait immédiatement les nouveaux garde-fous :
+  # retiré.
   if ! ecrire_etat_bascule; then
     retablir_etat_precedent
     return 1

@@ -465,6 +465,41 @@ ok "vide autorisé : accepté"             ask_input_eof "" "" yes
 egal "ligne partielle conservée"         "2222" "$(printf '2222' | ( ask_input "Valeur" "22" v_port >/dev/null 2>&1 && printf '%s' "$ASK_VALUE" ))"
 egal "ligne partielle « o » = oui"       "oui"  "$(printf 'o' | ( ask_yes_no "Q" "n" >/dev/null 2>&1 && echo oui || echo non ))"
 
+echo "== appliquer_pile (outil généré ip-fixe-commun) =="
+# La bibliothèque des outils de bascule est un heredoc du script : on l'en
+# extrait pour la charger telle qu'elle sera installée. Les commandes système
+# sont remplacées par des doublures qui n'agissent pas et notent leurs appels.
+TMP_COMMON="$(mktemp)"
+TMP_BIN="$(mktemp -d)"
+awk "/<<'COMMON'/ { on = 1; next } /^COMMON\$/ { on = 0 } on" "$CIBLE" > "$TMP_COMMON"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/appels"\nexit 4\n' "$TMP_BIN" > "$TMP_BIN/nmcli"
+printf '#!/bin/bash\nexit 0\n' > "$TMP_BIN/logger"
+chmod 755 "$TMP_BIN/nmcli" "$TMP_BIN/logger"
+appliquer_pile_nm() {  # $1 = pile, $2 = profil NetworkManager enregistré dans l'état
+  (
+    PATH="$TMP_BIN:$PATH"
+    # Lues par la bibliothèque chargée ci-dessous.
+    # shellcheck disable=SC2034
+    NET_STACK="$1"
+    # shellcheck disable=SC2034
+    NET_NM_CONNECTION="$2"
+    # shellcheck source=/dev/null
+    . "$TMP_COMMON"
+    appliquer_pile
+  )
+}
+ok "bibliothèque extraite et chargeable"       bash -n "$TMP_COMMON"
+# État publié avant write_nm_config (profil encore vide) : rien n'a été écrit,
+# la réapplication est un cas sans opération. Un « nmcli connection up "" »
+# échouerait et le retour arrière se tiendrait pour incomplet à chaque démarrage.
+rm -f "$TMP_BIN/appels"
+ok "profil vide : aucune opération, succès"    appliquer_pile_nm networkmanager ""
+ko "profil vide : nmcli n'est pas appelé"      test -e "$TMP_BIN/appels"
+ko "profil renseigné : échec de nmcli propagé" appliquer_pile_nm networkmanager "0f1e2d3c"
+egal "profil renseigné : « connection up UUID »" "connection up 0f1e2d3c" "$(cat "$TMP_BIN/appels" 2>/dev/null)"
+ko "pile inconnue refusée"                     appliquer_pile_nm inconnue ""
+rm -rf "$TMP_COMMON" "$TMP_BIN"
+
 echo "== run_cmd (propagation du code retour) =="
 # Non-régression : bash remet $? à 0 après un « if commande ; then » dont la
 # condition échoue. Une capture naïve du code retour ferait passer un échec pour
