@@ -384,6 +384,25 @@ ko "ens18 n'est plus mentionnée (inet6 seule ne compte pas)" ifupdown_file_ment
 ko "fichier inexistant refusé"           ifupdown_strip_iface_stanzas "$TMP_IF-absent" ens18
 rm -f "$TMP_IF"
 
+echo "== annuler_ecriture_reseau =="
+# Retire les fichiers générés, restaure ceux du manifeste réseau, et renvoie 1
+# si une restauration échoue (le garde-fou de démarrage est alors conservé).
+TMP_ANN="$(mktemp -d)"
+printf 'dhcp\n' > "$TMP_ANN/interfaces"
+cp "$TMP_ANN/interfaces" "$TMP_ANN/interfaces.bak"
+printf 'static\n' > "$TMP_ANN/interfaces"
+printf 'genere\n' > "$TMP_ANN/10-ens18"
+printf '%s\t%s\n' "$TMP_ANN/interfaces" "$TMP_ANN/interfaces.bak" > "$TMP_ANN/manifest"
+# shellcheck disable=SC2034
+NET_BACKUP_MANIFEST="$TMP_ANN/manifest" NET_GENERATED_FILES="$TMP_ANN/10-ens18" NET_STACK="ifupdown" DNS_METHOD=""
+ok   "annulation réussie"                    annuler_ecriture_reseau
+ko   "fichier généré retiré"                 test -e "$TMP_ANN/10-ens18"
+egal "fichier d'origine restauré"            "dhcp" "$(cat "$TMP_ANN/interfaces")"
+printf '%s\t%s\n' "$TMP_ANN/interfaces" "$TMP_ANN/absent.bak" > "$TMP_ANN/manifest"
+ko   "sauvegarde absente : échec signalé"    annuler_ecriture_reseau
+egal "fichier laissé intact malgré l'échec"  "dhcp" "$(cat "$TMP_ANN/interfaces")"
+rm -rf "$TMP_ANN"
+
 echo "== ask_input (entrée standard fermée) =="
 # Sans terminal, une saisie obligatoire sans valeur par défaut acceptable ne
 # doit pas boucler indéfiniment : le script s'arrête (code non nul). Le sous-

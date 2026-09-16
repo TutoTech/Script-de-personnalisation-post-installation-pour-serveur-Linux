@@ -77,7 +77,7 @@ Le passage en IP fixe est l'opération la plus risquée d'un post-installation :
 | **Bascule en toute fin de script**, exécutée de façon détachée via `systemd-run` | La coupure SSH ne peut plus interrompre l'opération à mi-chemin |
 | **Retour automatique au DHCP** : une minuterie systemd restaure la configuration précédente sans confirmation de votre part, et un service de démarrage fait de même si le serveur ne répond pas après un redémarrage | Un serveur injoignable nécessitant un déplacement physique ou une console IPMI |
 
-Le garde-fou de démarrage et les commandes de retour arrière sont installés **dès l'enregistrement de la configuration** (étape 5), et non au seul moment de la bascule : un redémarrage ou une interruption du script avant la fin reste couvert. Avec NetworkManager, le fichier du profil est sauvegardé avant modification et restauré à l'identique en cas de retour arrière.
+Le garde-fou de démarrage et les commandes de retour arrière sont installés **avant la première écriture de fichier** (étape 5), et non au seul moment de la bascule : un redémarrage ou une interruption du script avant la fin reste couvert. Si ces outils ne peuvent pas être installés, rien n'est écrit ; si une écriture échoue en cours de route, les fichiers déjà modifiés sont restaurés. Avec NetworkManager, le fichier du profil est sauvegardé avant modification et restauré à l'identique en cas de retour arrière.
 
 Après la bascule, reconnectez-vous sur la nouvelle adresse et validez :
 
@@ -220,7 +220,7 @@ Switching to a static IP is the riskiest part of any post-install: a single typo
 | **Switch-over at the very end of the script**, run detached via `systemd-run` | An SSH disconnect can no longer interrupt the operation halfway through |
 | **Automatic DHCP rollback**: a systemd timer restores the previous configuration unless you confirm, and a boot-time service does the same if the server does not answer after a reboot | An unreachable server requiring physical or IPMI console access |
 
-The boot-time safeguard and the rollback commands are installed **as soon as the configuration is written** (step 5), not only at switch-over time: a reboot or an interrupted script before the end is still covered. With NetworkManager, the profile file is backed up before modification and restored verbatim on rollback.
+The boot-time safeguard and the rollback commands are installed **before the first file is written** (step 5), not only at switch-over time: a reboot or an interrupted script before the end is still covered. If those tools cannot be installed, nothing is written; if a write fails midway, the files already modified are restored. With NetworkManager, the profile file is backed up before modification and restored verbatim on rollback.
 
 After the switch, reconnect on the new address and confirm:
 
