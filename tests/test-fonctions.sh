@@ -596,6 +596,57 @@ cp "$TMP_SE/sauvegarde" "$TMP_SE/rollback.env.precedent"
 ok "sans écriture, précédent mis de côté : en attente" bascule_ip_en_attente
 rm -rf "$TMP_SE"
 
+echo "== retablir_etat_precedent / retablir_etat_ssh_precedent (échecs propagés) =="
+# Un rétablissement qui échoue (état impossible à remettre en place, garde-fou
+# non réactivable) doit être signalé à l'appelant, qui n'annonce alors pas le
+# changement précédent comme surveillé.
+TMP_RP="$(mktemp -d)"
+mkdir -p "$TMP_RP/bin" "$TMP_RP/etat"
+# shellcheck disable=SC2016
+printf '#!/bin/bash\ncase "$1" in\n  enable) [ ! -e "%s/enable-echoue" ] ;;\n  *) exit 0 ;;\nesac\n' "$TMP_RP" > "$TMP_RP/bin/systemctl"
+chmod 755 "$TMP_RP/bin/systemctl"
+# Lues par les fonctions testées.
+# shellcheck disable=SC2034
+STATE_DIR="$TMP_RP/etat" ROLLBACK_STATE="$TMP_RP/etat/rollback.env" SSH_AUTH_STATE="$TMP_RP/etat/ssh-auth.env"
+# shellcheck disable=SC2034
+NET_PREVIOUS_PENDING=1 NET_PRECEDENT_RETABLI=1
+retablir_avec_systemctl() {  # code retour de la fonction ; le drapeau est relevé dans un fichier
+  (
+    # shellcheck disable=SC2030,SC2031
+    PATH="$TMP_RP/bin:$PATH"
+    retablir_etat_precedent
+    rc=$?
+    printf '%s' "$NET_PRECEDENT_RETABLI" > "$TMP_RP/drapeau"
+    exit "$rc"
+  )
+}
+printf 'NET_CIDR=10.0.0.1/24\n' > "$TMP_RP/etat/rollback.env.precedent"
+ok   "état précédent rétabli : succès"                      retablir_avec_systemctl
+ok   "état précédent en place"                              grep -q '^NET_CIDR=10.0.0.1/24$' "$ROLLBACK_STATE"
+ko   "état mis de côté consommé"                            test -e "$TMP_RP/etat/rollback.env.precedent"
+egal "succès : drapeau intact"                              "1" "$(cat "$TMP_RP/drapeau")"
+printf 'NET_CIDR=10.0.0.1/24\n' > "$TMP_RP/etat/rollback.env.precedent"
+: > "$TMP_RP/enable-echoue"
+ko   "garde-fou non réactivable : échec propagé"            retablir_avec_systemctl
+egal "garde-fou non réactivable : drapeau à 0"              "0" "$(cat "$TMP_RP/drapeau")"
+rm -f "$TMP_RP/enable-echoue"
+printf 'NET_CIDR=10.0.0.1/24\n' > "$TMP_RP/etat/rollback.env.precedent"
+ROLLBACK_STATE="$TMP_RP/inexistant/rollback.env"
+ko   "déplacement impossible : échec propagé"               retablir_avec_systemctl
+ok   "déplacement impossible : état mis de côté conservé"   test -e "$TMP_RP/etat/rollback.env.precedent"
+egal "déplacement impossible : drapeau à 0"                 "0" "$(cat "$TMP_RP/drapeau")"
+# shellcheck disable=SC2034
+NET_PREVIOUS_PENDING=0
+ok   "aucun changement précédent : rien à faire, succès"    retablir_avec_systemctl
+printf 'SSHD_TARGET=/etc/ssh/sshd_config\n' > "$TMP_RP/etat/ssh-auth.env.precedent"
+ok   "état SSH précédent rétabli : succès"                  retablir_etat_ssh_precedent
+ok   "état SSH précédent en place"                          grep -q '^SSHD_TARGET=' "$SSH_AUTH_STATE"
+ok   "aucun état SSH mis de côté : succès"                  retablir_etat_ssh_precedent
+printf 'SSHD_TARGET=/etc/ssh/sshd_config\n' > "$TMP_RP/etat/ssh-auth.env.precedent"
+SSH_AUTH_STATE="$TMP_RP/inexistant/ssh-auth.env"
+ko   "déplacement SSH impossible : échec propagé"           retablir_etat_ssh_precedent
+rm -rf "$TMP_RP"
+
 echo "== annuler_ecriture_reseau =="
 # Retire les fichiers générés, restaure ceux du manifeste réseau, et renvoie 1
 # si une restauration échoue (le garde-fou de démarrage est alors conservé).

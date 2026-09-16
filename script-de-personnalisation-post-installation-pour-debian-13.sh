@@ -160,6 +160,7 @@ NET_NM_CONNECTION=""
 NET_NM_KEYFILE=""       # fichier de profil NetworkManager sauvegardé avant modification
 NET_NM_MODIFIED=0       # 1 dès que « nmcli connection modify » a réécrit le profil
 NET_PREVIOUS_PENDING=0  # 1 si une bascule précédente, encore surveillée, est remplacée
+NET_PRECEDENT_RETABLI=1  # 0 si l'état d'un changement précédent n'a pas pu être rétabli (retablir_etat_precedent)
 SSH_PREVIOUS_PENDING=0  # 1 si un durcissement précédent, encore surveillé, est remplacé
 NET_IFUPDOWN_FILE=""
 NET_GENERATED_FILES=""
@@ -2432,17 +2433,25 @@ UNIT2
 # démarrage est réactivé. Sa minuterie ne peut pas être réarmée avec le délai
 # d'origine : l'utilisateur est invité à confirmer ou annuler lui-même.
 ################################################################################
+# Renvoie 1, et met NET_PRECEDENT_RETABLI à 0, si l'état n'a pas pu être remis
+# en place ou si le garde-fou de démarrage n'a pas pu être réactivé : l'appelant
+# ne doit alors pas annoncer le changement précédent comme surveillé.
 retablir_etat_precedent() {
   (( NET_PREVIOUS_PENDING )) || return 0
   [[ -f "$STATE_DIR/rollback.env.precedent" ]] || return 0
-  if mv -f "$STATE_DIR/rollback.env.precedent" "$ROLLBACK_STATE"; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1 || true
-    log_warn "État du changement précédent rétabli : garde-fou de démarrage actif, minuterie NON réarmée."
-    echo "  Confirmez ce changement (sudo ip-fixe-confirmer) ou annulez-le (sudo ip-fixe-rollback)." >&2
-  else
+  if ! mv -f "$STATE_DIR/rollback.env.precedent" "$ROLLBACK_STATE"; then
     log_err "Impossible de rétablir l'état du changement précédent : vérifiez $STATE_DIR à la console."
+    NET_PRECEDENT_RETABLI=0
+    return 1
   fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if ! systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1; then
+    log_err "État du changement précédent rétabli, mais son garde-fou de démarrage n'a PAS pu être réactivé : aucun retour automatique au prochain redémarrage."
+    NET_PRECEDENT_RETABLI=0
+    return 1
+  fi
+  log_warn "État du changement précédent rétabli : garde-fou de démarrage actif, minuterie NON réarmée."
+  echo "  Confirmez ce changement (sudo ip-fixe-confirmer) ou annulez-le (sudo ip-fixe-rollback)." >&2
   return 0
 }
 
@@ -3578,11 +3587,15 @@ CONFIRM
 
 # Remet en place l'état d'un durcissement précédent quand son remplacement a
 # échoué après l'arrêt de sa minuterie.
+# Renvoie 1 si l'état n'a pas pu être remis en place (l'appelant est déjà sur un
+# chemin d'échec : il le propage).
 retablir_etat_ssh_precedent() {
   local precedent="$STATE_DIR/ssh-auth.env.precedent"
   [[ -f "$precedent" ]] || return 0
-  mv -f "$precedent" "$SSH_AUTH_STATE" ||
+  if ! mv -f "$precedent" "$SSH_AUTH_STATE"; then
     log_err "Impossible de rétablir l'état du durcissement précédent : vérifiez $STATE_DIR à la console."
+    return 1
+  fi
   return 0
 }
 
@@ -3604,11 +3617,13 @@ reactiver_mot_de_passe_si_orphelin() {
   log_warn "Le durcissement précédent n'a plus de retour automatique : réactivation immédiate du mot de passe."
   if [[ -x /usr/local/sbin/ssh-cles-rollback ]] && /usr/local/sbin/ssh-cles-rollback >/dev/null 2>&1; then
     log_ok "Authentification par mot de passe réactivée."
-  else
-    log_err "Réactivation impossible : posez « PasswordAuthentication yes » dans ${cible:-la configuration sshd} depuis la console."
+    SSH_PREVIOUS_PENDING=0
+    return 0
   fi
-  SSH_PREVIOUS_PENDING=0
-  return 0
+  # Échec propagé : l'appelant le compte ; le durcissement précédent reste sans
+  # filet tant que l'utilisateur n'intervient pas à la console.
+  log_err "Réactivation impossible : posez « PasswordAuthentication yes » dans ${cible:-la configuration sshd} depuis la console."
+  return 1
 }
 
 ################################################################################
@@ -4631,8 +4646,12 @@ durcir_authentification() {
     if ! ask_yes_no "Désactiver le mot de passe SANS aucun filet de sécurité ?" "n"; then
       log_info "Authentification par mot de passe conservée."
       # Si un durcissement précédent a perdu sa minuterie dans l'opération,
-      # son mot de passe est réactivé tout de suite.
-      reactiver_mot_de_passe_si_orphelin "$cible"
+      # son mot de passe est réactivé tout de suite ; un échec est compté.
+      if ! reactiver_mot_de_passe_si_orphelin "$cible"; then
+        SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+        trap - INT TERM
+        return 1
+      fi
       trap - INT TERM
       return 0
     fi
@@ -4652,7 +4671,11 @@ durcir_authentification() {
       echo ""
       if ! ask_yes_no "Désactiver le mot de passe SANS filet de sécurité ?" "n"; then
         log_info "Authentification par mot de passe conservée."
-        reactiver_mot_de_passe_si_orphelin "$cible"
+        if ! reactiver_mot_de_passe_si_orphelin "$cible"; then
+          SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+          trap - INT TERM
+          return 1
+        fi
         trap - INT TERM
         return 0
       fi
@@ -5241,11 +5264,15 @@ if (( NET_STEP_ALLOWED )) && ask_yes_no "Souhaitez-vous configurer une IP fixe ?
       log_err "Les outils de bascule et de retour arrière n'ont pas pu être installés."
       echo "  Sans garde-fou, appliquer une IP fixe serait un pari : rien n'est écrit,"
       echo "  le serveur conserve sa configuration actuelle."
-      if (( NET_PREVIOUS_PENDING )); then
+      if (( NET_PREVIOUS_PENDING )) && (( NET_PRECEDENT_RETABLI )); then
         # Soit rien n'a été touché (échec avant l'arrêt des anciennes unités),
-        # soit install_network_tools a déjà rétabli l'état précédent.
+        # soit install_network_tools a rétabli l'état précédent avec succès.
         log_warn "Le changement précédent reste sous surveillance de son garde-fou de démarrage ; sa minuterie a pu être désarmée."
         echo "  Confirmez-le (sudo ip-fixe-confirmer) ou annulez-le (sudo ip-fixe-rollback)."
+      elif (( NET_PREVIOUS_PENDING )); then
+        # Le rétablissement a échoué (retablir_etat_precedent l'a signalé) : le
+        # changement précédent n'a plus de surveillance garantie.
+        log_err "Le changement précédent n'est PLUS sous surveillance automatique : tranchez sans attendre (sudo ip-fixe-confirmer ou sudo ip-fixe-rollback)."
       else
         desinstaller_outils_reseau
       fi
@@ -5302,8 +5329,12 @@ if (( NET_STEP_ALLOWED )) && ask_yes_no "Souhaitez-vous configurer une IP fixe ?
         ecrire_etat_bascule || true
         if annuler_ecriture_reseau; then
           if (( NET_PREVIOUS_PENDING )) && [[ -f "$STATE_DIR/rollback.env.precedent" ]]; then
-            # La bascule précédente redevient celle sous surveillance.
-            retablir_etat_precedent
+            # La bascule précédente redevient celle sous surveillance ; si le
+            # rétablissement échoue (signalé par la fonction), elle ne l'est plus.
+            if ! retablir_etat_precedent; then
+              echo "  Le changement précédent n'est PLUS sous surveillance automatique : tranchez sans" >&2
+              echo "  attendre (sudo ip-fixe-confirmer ou sudo ip-fixe-rollback)." >&2
+            fi
           else
             desinstaller_outils_reseau
             echo "  Le serveur conserve sa configuration actuelle."
