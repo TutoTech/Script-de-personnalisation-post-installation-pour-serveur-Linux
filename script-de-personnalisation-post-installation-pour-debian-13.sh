@@ -1998,6 +1998,19 @@ if est_confirme; then
   exit 0
 fi
 
+# Rien n'a été écrit : état publié à l'installation des outils, préparation
+# interrompue avant le premier fichier, et aucun changement précédent mis de
+# côté (charger_etat l'aurait repris). Il n'y a rien à restaurer, et réappliquer
+# la pile (ifdown/ifup, bail DHCP relâché, redémarrage de networkd) perturberait
+# un réseau intact. Le garde-fou de démarrage n'a plus d'objet : retiré.
+if etat_sans_ecriture; then
+  journal "Aucune écriture réseau à défaire : rien à restaurer, garde-fou de démarrage retiré."
+  systemctl disable ip-fixe-watchdog.service >/dev/null 2>&1
+  rm -f /etc/systemd/system/ip-fixe-watchdog.service
+  systemctl daemon-reload >/dev/null 2>&1
+  exit 0
+fi
+
 journal "AUCUNE CONFIRMATION REÇUE — restauration de la configuration réseau précédente."
 
 echecs=0
@@ -2736,6 +2749,65 @@ sshd_restore_or_remove() {
 }
 
 ################################################################################
+# FONCTION : Copie de référence du durcissement SSH (étape 8)
+################################################################################
+# La copie de l'exécution (« .bak.RUN_STAMP », backup_file_once) date d'AVANT
+# l'étape 7 quand le fichier préexistait : y revenir déferait aussi le port et
+# l'accès root, appliqués et vérifiés entre-temps, et pourrait fermer l'accès
+# par le nouveau port. Le durcissement prend donc SA propre copie, juste avant
+# de modifier le fichier ; un fichier alors absent est noté comme tel (marqueur)
+# pour être supprimé, et non restauré, si le durcissement échoue. C'est aussi
+# cette copie que l'outil ssh-cles-rollback utilise en repli.
+################################################################################
+sshd_ref_durcissement() { printf '%s.avant-durcissement.%s' "${1:-}" "$RUN_STAMP"; }
+
+sshd_snapshot_durcissement() {
+  local f="${1:-}" ref
+  [[ -n "$f" ]] || return 1
+  ref="$(sshd_ref_durcissement "$f")"
+  rm -f "$ref" "$ref.absent" 2>/dev/null
+  if [[ -e "$f" || -L "$f" ]]; then
+    cp -a "$f" "$ref" 2>/dev/null || return 1
+  else
+    : > "$ref.absent" 2>/dev/null || return 1
+  fi
+  return 0
+}
+
+# Ramène le fichier à sa copie de référence. Mêmes garde-fous que
+# sshd_restore_or_remove : copie via un fichier temporaire, original jamais
+# supprimé si la copie échoue, fichier principal jamais supprimé.
+sshd_restaurer_durcissement() {
+  local f="${1:-}" ref rc=0
+  [[ -n "$f" ]] || return 1
+  ref="$(sshd_ref_durcissement "$f")"
+  if [[ -e "$ref.absent" ]]; then
+    if [[ "$f" == "/etc/ssh/sshd_config" ]]; then
+      log_err "Aucune copie de référence de /etc/ssh/sshd_config : fichier laissé en place, à vérifier à la main."
+      return 1
+    fi
+    if ! rm -f "$f"; then
+      log_err "Suppression de $f impossible : fichier laissé en place, à vérifier à la main."
+      return 1
+    fi
+    rm -f "$ref.absent"
+    return 0
+  fi
+  restore_file "$f" "$ref" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2)
+      log_err "Copie de référence du durcissement introuvable pour $f : fichier laissé en place, à vérifier à la main."
+      return 1
+      ;;
+    *)
+      log_err "Restauration de $f impossible (copie en échec) : fichier laissé en place, à vérifier à la main."
+      return 1
+      ;;
+  esac
+}
+
+################################################################################
 # FONCTION : SSH est-il démarré par activation de socket ?
 ################################################################################
 # Debian fournit une unité « ssh.socket » (activation par socket), mais elle
@@ -3320,9 +3392,11 @@ poser_directive "$SSHD_TARGET" KbdInteractiveAuthentication yes
 
 SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
 if ! "$SSHD_BIN" -t 2>/dev/null; then
-  journal "Configuration invalide après réécriture : restauration de la sauvegarde."
+  # Seul le fichier visé a été réécrit : lui seul est ramené à sa copie de
+  # référence, prise juste avant le durcissement — et non la copie de
+  # l'exécution, antérieure aux réglages de l'étape 7 (port, accès root).
+  journal "Configuration invalide après réécriture : retour à la copie de référence du durcissement."
   [ -e "${SSHD_TARGET_BACKUP:-}" ] && cp -a "$SSHD_TARGET_BACKUP" "$SSHD_TARGET"
-  [ -e "${SSHD_MAIN_BACKUP:-}" ] && cp -a "$SSHD_MAIN_BACKUP" /etc/ssh/sshd_config
 fi
 
 if systemctl is-active --quiet ssh.service 2>/dev/null; then
@@ -3387,8 +3461,10 @@ CONFIRM
   if ! {
       echo "# État du durcissement SSH — généré le $(date)"
       printf 'SSHD_TARGET=%q\n'        "$target"
-      printf 'SSHD_TARGET_BACKUP=%q\n' "${target}.bak.${RUN_STAMP}"
-      printf 'SSHD_MAIN_BACKUP=%q\n'   "/etc/ssh/sshd_config.bak.${RUN_STAMP}"
+      # Repli de ssh-cles-rollback : la copie de référence du durcissement
+      # (sshd_snapshot_durcissement), pas la copie de l'exécution, antérieure à
+      # l'étape 7 quand le fichier préexistait.
+      printf 'SSHD_TARGET_BACKUP=%q\n' "$(sshd_ref_durcissement "$target")"
       printf 'CONFIRMED_FLAG=%q\n'     "$SSH_AUTH_CONFIRMED_FLAG"
     } > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$SSH_AUTH_STATE"; then
     rm -f "$tmp"
@@ -4342,19 +4418,24 @@ durcir_authentification() {
     SSH_PREVIOUS_PENDING=1
   fi
 
-  # Sauvegardes AVANT toute modification : sans elles, la restauration de secours
-  # (sshd_restore_or_remove) ne saurait pas distinguer un fichier d'inclusion
-  # préexistant d'un fichier créé ici, et pourrait supprimer le premier.
-  # Le fichier d'inclusion a pu être CRÉÉ par l'étape 7 (port, accès root) au
-  # cours de cette exécution : il n'a alors pas de copie de l'étape 7, et celle
-  # prise ici en est la version d'après l'étape 7. C'est voulu : ces réglages
-  # ont été appliqués et VÉRIFIÉS (port en écoute) avant d'arriver ici, et la
-  # session de l'utilisateur peut déjà passer par le nouveau port. Un échec du
-  # durcissement ne défait donc que le durcissement, jamais l'étape 7 : le
-  # fichier est ramené à cette version, pas supprimé.
+  # Sauvegardes de l'exécution AVANT toute modification (manifeste général),
+  # puis copie de référence PROPRE AU DURCISSEMENT. Les réglages de l'étape 7
+  # (port, accès root) ont été appliqués et VÉRIFIÉS (port en écoute) avant
+  # d'arriver ici, et la session de l'utilisateur peut déjà passer par le
+  # nouveau port : un échec du durcissement ne doit défaire que le
+  # durcissement, jamais l'étape 7. Le fichier est donc ramené à sa version
+  # d'avant le durcissement (sshd_restaurer_durcissement), qu'il ait préexisté
+  # ou qu'il ait été créé par l'étape 7. La copie de l'exécution, elle, date
+  # d'avant l'étape 7 quand le fichier préexistait : ce n'est pas la bonne
+  # référence pour cette étape.
   if ! backup_file_once /etc/ssh/sshd_config ||
      { [[ "$cible" != "/etc/ssh/sshd_config" ]] && ! backup_file_once "$cible"; }; then
     log_err "Sauvegarde de la configuration SSH impossible : durcissement abandonné, rien n'est modifié."
+    SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+    return 1
+  fi
+  if ! sshd_snapshot_durcissement "$cible"; then
+    log_err "Copie de référence de $cible impossible : durcissement abandonné, rien n'est modifié."
     SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
     return 1
   fi
@@ -4363,7 +4444,7 @@ durcir_authentification() {
   set_sshd_directive "$cible" "PubkeyAuthentication" "yes"
   if ! "$bin" -t 2>/dev/null; then
     log_err "La configuration SSH devient invalide : restauration."
-    sshd_restore_or_remove "$cible"
+    sshd_restaurer_durcissement "$cible"
     SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
     return 1
   fi
@@ -4499,7 +4580,7 @@ durcir_authentification() {
 
   if ! "$bin" -t 2>/dev/null; then
     log_err "Configuration invalide : restauration immédiate."
-    if sshd_restore_or_remove "$cible"; then
+    if sshd_restaurer_durcissement "$cible"; then
       ssh_reload_config || true
       # La minuterie, si elle a été armée, réécrirait à son échéance le fichier
       # tout juste restauré : elle est désarmée, il n'y a plus rien à défaire.

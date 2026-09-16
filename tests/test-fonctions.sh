@@ -227,6 +227,27 @@ ok   "sans sauvegarde : fichier créé par nous, supprimé" sshd_restore_or_remo
 ko   "le fichier n'existe plus"             test -e "$TMP_RS"
 rm -f "$TMP_RS" "$TMP_RS.bak.$RUN_STAMP"
 
+echo "== sshd_snapshot_durcissement / sshd_restaurer_durcissement =="
+# La copie de l'exécution (.bak.RUN_STAMP) date d'avant l'étape 7 ; le
+# durcissement (étape 8) doit revenir à SA copie de référence, prise juste
+# avant lui, sans défaire l'étape 7.
+TMP_SD="$(mktemp)"
+printf 'avant etape 7\n' > "$TMP_SD.bak.$RUN_STAMP"
+printf 'Port 2222\n' > "$TMP_SD"
+ok   "copie de référence prise"                        sshd_snapshot_durcissement "$TMP_SD"
+printf 'Port 2222\nPasswordAuthentication no\n' > "$TMP_SD"
+ok   "restauration réussie"                            sshd_restaurer_durcissement "$TMP_SD"
+egal "version d'après l'étape 7 rétablie, pas celle d'avant" "Port 2222" "$(cat "$TMP_SD")"
+egal "copie de l'exécution intacte"                    "avant etape 7" "$(cat "$TMP_SD.bak.$RUN_STAMP")"
+rm -f "$TMP_SD" "$TMP_SD.bak.$RUN_STAMP" "$(sshd_ref_durcissement "$TMP_SD")"
+ok   "fichier absent : absence notée"                  sshd_snapshot_durcissement "$TMP_SD"
+ok   "marqueur d'absence présent"                      test -e "$(sshd_ref_durcissement "$TMP_SD").absent"
+printf 'PasswordAuthentication no\n' > "$TMP_SD"
+ok   "fichier créé par le durcissement : supprimé"     sshd_restaurer_durcissement "$TMP_SD"
+ko   "le fichier n'existe plus"                        test -e "$TMP_SD"
+ko   "marqueur retiré"                                 test -e "$(sshd_ref_durcissement "$TMP_SD").absent"
+ko   "ni copie de référence ni marqueur : refus"       sshd_restaurer_durcissement "$TMP_SD"
+
 echo "== v_port =="
 ok "22 accepté"                          v_port 22
 ok "65535 accepté"                       v_port 65535
@@ -607,6 +628,48 @@ egal "état écrit, précédent présent : lu tel quel"       "10.0.0.1/24" "$(c
 egal "sans écriture, aucun précédent : lu tel quel"      "10.0.0.9/24" "$(cidr_charge "$TMP_CE/vide" "")"
 egal "sans écriture, précédent présent : précédent repris" "10.0.0.1/24" "$(cidr_charge "$TMP_CE/vide" "$TMP_CE/plein")"
 rm -rf "$TMP_CE"
+
+echo "== ip-fixe-rollback (outil généré) : état sans écriture, état avec écriture =="
+# L'outil est extrait de son heredoc ; sa bibliothèque et ses chemins système
+# sont redirigés vers un répertoire temporaire, et ses commandes système sont
+# doublées (elles notent leurs appels). Un état sans écriture ne doit rien
+# restaurer ni réappliquer (ifdown/ifup perturberaient un réseau intact) : il
+# retire le garde-fou et s'arrête. Un état avec écriture restaure puis réapplique.
+TMP_RB="$(mktemp -d)"
+mkdir -p "$TMP_RB/bin"
+sed -e "s|^STATE_FILE=.*|STATE_FILE=\"$TMP_RB/rollback.env\"|" "$TMP_COMMON" > "$TMP_RB/commun"
+awk "/ip-fixe-rollback 755 bash <<'ROLLBACK'/ { on = 1; next } /^ROLLBACK\$/ { on = 0 } on" "$CIBLE" |
+  sed -e "s|^\. /usr/local/sbin/ip-fixe-commun\$|. $TMP_RB/commun|" \
+      -e "s|/etc/systemd/system/ip-fixe-watchdog.service|$TMP_RB/watchdog.service|g" > "$TMP_RB/rollback"
+ok "outil extrait et analysable"                        bash -n "$TMP_RB/rollback"
+for c in systemctl logger ifdown ifup ip dhcpcd dhclient pkill sleep ping getent networkctl nmcli resolvconf; do
+  # shellcheck disable=SC2016
+  printf '#!/bin/bash\nprintf "%%s\\n" "%s $*" >> "%s/appels"\nexit 0\n' "$c" "$TMP_RB" > "$TMP_RB/bin/$c"
+  chmod 755 "$TMP_RB/bin/$c"
+done
+rollback_test() {  # $1 = état à charger
+  cp "$1" "$TMP_RB/rollback.env"
+  rm -f "$TMP_RB/appels"
+  : > "$TMP_RB/watchdog.service"
+  # shellcheck disable=SC2030,SC2031
+  ( PATH="$TMP_RB/bin:$PATH"; bash "$TMP_RB/rollback" >/dev/null 2>&1 )
+}
+: > "$TMP_RB/manifest.vide"
+printf 'NET_STACK=ifupdown\nNET_IFACE=ens18\nNET_GATEWAY=10.0.0.1\nBACKUP_MANIFEST=%q\nNET_NM_MODIFIED=0\nCONFIRMED_FLAG=%q\nRUNTIME_CONFIRMED_FLAG=%q\n' \
+  "$TMP_RB/manifest.vide" "$TMP_RB/confirmed" "$TMP_RB/confirmed.run" > "$TMP_RB/etat.vide"
+printf 'dhcp\n' > "$TMP_RB/interfaces.bak"
+printf 'static\n' > "$TMP_RB/interfaces"
+printf '%s\t%s\n' "$TMP_RB/interfaces" "$TMP_RB/interfaces.bak" > "$TMP_RB/manifest.plein"
+sed -e "s|manifest.vide|manifest.plein|" "$TMP_RB/etat.vide" > "$TMP_RB/etat.plein"
+ok   "sans écriture : succès"                           rollback_test "$TMP_RB/etat.vide"
+ko   "sans écriture : ni ifdown, ni ifup, ni ip"        grep -qE '^(ifdown|ifup|ip) ' "$TMP_RB/appels"
+ok   "sans écriture : garde-fou désactivé"              grep -q '^systemctl disable ip-fixe-watchdog.service' "$TMP_RB/appels"
+ko   "sans écriture : unité du garde-fou retirée"       test -e "$TMP_RB/watchdog.service"
+ok   "avec écriture : succès"                           rollback_test "$TMP_RB/etat.plein"
+egal "avec écriture : fichier restauré"                 "dhcp" "$(cat "$TMP_RB/interfaces")"
+ok   "avec écriture : pile réappliquée (ifup)"          grep -q '^ifup ens18' "$TMP_RB/appels"
+ko   "avec écriture : unité du garde-fou retirée aussi" test -e "$TMP_RB/watchdog.service"
+rm -rf "$TMP_RB"
 rm -rf "$TMP_COMMON" "$TMP_BIN"
 
 echo "== run_cmd (propagation du code retour) =="
