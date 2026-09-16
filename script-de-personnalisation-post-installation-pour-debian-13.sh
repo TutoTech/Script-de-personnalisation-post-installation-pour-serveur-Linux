@@ -1849,10 +1849,32 @@ install_network_tools() {
 set -u
 STATE_FILE="/var/lib/personnalisation-debian13/rollback.env"
 
+# Un état « sans écriture » ne décrit ni sauvegarde, ni fichier généré, ni
+# profil NetworkManager modifié : c'est celui publié à l'installation des
+# outils, AVANT la première écriture. Il n'y a rien à restaurer avec lui.
+etat_sans_ecriture() {
+  [ -s "${BACKUP_MANIFEST:-}" ] && return 1
+  [ -s "${GENERATED_LIST:-}" ] && return 1
+  [ -n "${NET_GENERATED_FILES:-}" ] && return 1
+  [ "${NET_NM_MODIFIED:-1}" = "1" ] && return 1
+  return 0
+}
+
 charger_etat() {
   [ -r "$STATE_FILE" ] || { echo "État introuvable : $STATE_FILE" >&2; return 1; }
   # shellcheck disable=SC1090
   . "$STATE_FILE"
+  # Le script a pu être interrompu (ou la machine redémarrée) entre la
+  # publication de cet état et la première écriture. S'il remplaçait un
+  # changement précédent encore surveillé, celui-ci a été mis de côté dans
+  # « .precedent » : c'est lui qui vaut, lui seul sait revenir à la
+  # configuration d'origine. Le script le retire une fois le remplacement
+  # effectivement écrit.
+  if etat_sans_ecriture && [ -r "$STATE_FILE.precedent" ]; then
+    journal "État sans écriture : reprise de l'état du changement précédent."
+    # shellcheck disable=SC1090
+    . "$STATE_FILE.precedent"
+  fi
 }
 
 est_confirme() {
@@ -2214,10 +2236,20 @@ UNIT
   # Une bascule précédente encore surveillée est remplacée : son état est mis
   # de côté pour être rétabli si quoi que ce soit échoue ensuite (ici ou à
   # l'écriture de la nouvelle configuration, voir l'étape 5). Ses manifestes,
-  # propres à son exécution, restent intacts.
-  rm -f "$STATE_DIR/rollback.env.precedent"
+  # propres à son exécution, restent intacts. Tant que le nouvel état ne décrit
+  # aucune écriture, les outils (charger_etat, dans ip-fixe-commun) se rabattent
+  # sur cet état mis de côté : un redémarrage ou une interruption avant le
+  # premier fichier laisse le changement précédent protégé.
+  # Si l'état actif est lui-même sans écriture (remplacement précédent
+  # interrompu) alors qu'un état mis de côté existe, c'est ce dernier qui
+  # décrit le changement réellement en attente : il est conservé tel quel.
   if (( NET_PREVIOUS_PENDING )) && [[ -f "$ROLLBACK_STATE" ]]; then
-    cp -a "$ROLLBACK_STATE" "$STATE_DIR/rollback.env.precedent" || return 1
+    if ! { etat_bascule_sans_ecriture "$ROLLBACK_STATE" && [[ -f "$STATE_DIR/rollback.env.precedent" ]]; }; then
+      rm -f "$STATE_DIR/rollback.env.precedent"
+      cp -a "$ROLLBACK_STATE" "$STATE_DIR/rollback.env.precedent" || return 1
+    fi
+  else
+    rm -f "$STATE_DIR/rollback.env.precedent"
   fi
 
   # Les unités d'une exécution PRÉCÉDENTE sont arrêtées AVANT la publication du
@@ -2238,7 +2270,9 @@ UNIT
   # (voir ecrire_etat_bascule). Publié avant toute écriture, il est sans effet
   # pour les outils : manifeste vide (rien à restaurer), aucun fichier généré
   # (rien à supprimer) et, sous NetworkManager, aucun profil (rien à
-  # réappliquer, voir appliquer_pile).
+  # réappliquer, voir appliquer_pile) ; et s'il remplace un changement encore
+  # surveillé, les outils lisent l'état mis de côté (charger_etat) tant que
+  # rien n'est écrit.
   if ! ecrire_etat_bascule; then
     retablir_etat_precedent
     return 1
@@ -2336,7 +2370,38 @@ declarer_fichier_genere() {
 bascule_ip_en_attente() {
   [[ -r "$ROLLBACK_STATE" ]] || return 1
   [[ ! -e "$CONFIRMED_FLAG" && ! -e "$RUNTIME_CONFIRMED_FLAG" ]] || return 1
+  # Un état sans écriture (préparation interrompue avant le premier fichier)
+  # qui n'a mis de côté aucun changement précédent ne surveille rien.
+  if etat_bascule_sans_ecriture "$ROLLBACK_STATE" && [[ ! -f "$STATE_DIR/rollback.env.precedent" ]]; then
+    return 1
+  fi
   return 0
+}
+
+################################################################################
+# FONCTION : Un état de bascule est-il « sans écriture » ?
+################################################################################
+# Vrai s'il ne décrit ni sauvegarde, ni fichier généré, ni profil NetworkManager
+# modifié : c'est l'état publié à l'installation des outils, avant la première
+# écriture. Même critère que etat_sans_ecriture dans ip-fixe-commun. Le fichier
+# est relu dans un sous-shell : ses valeurs n'atteignent pas le script. Un état
+# d'une version antérieure (sans NET_NM_MODIFIED) est tenu pour écrit.
+################################################################################
+etat_bascule_sans_ecriture() {
+  local f="${1:-}"
+  [[ -r "$f" ]] || return 1
+  (
+    # Les valeurs courantes du script ne doivent pas se substituer à celles,
+    # éventuellement absentes, du fichier relu.
+    unset BACKUP_MANIFEST GENERATED_LIST NET_GENERATED_FILES NET_NM_MODIFIED
+    # shellcheck disable=SC1090
+    . "$f" >/dev/null 2>&1 || exit 1
+    [[ -s "${BACKUP_MANIFEST:-}" ]] && exit 1
+    [[ -s "${GENERATED_LIST:-}" ]] && exit 1
+    [[ -n "${NET_GENERATED_FILES:-}" ]] && exit 1
+    [[ "${NET_NM_MODIFIED:-1}" == "1" ]] && exit 1
+    exit 0
+  )
 }
 
 ################################################################################
@@ -4280,6 +4345,13 @@ durcir_authentification() {
   # Sauvegardes AVANT toute modification : sans elles, la restauration de secours
   # (sshd_restore_or_remove) ne saurait pas distinguer un fichier d'inclusion
   # préexistant d'un fichier créé ici, et pourrait supprimer le premier.
+  # Le fichier d'inclusion a pu être CRÉÉ par l'étape 7 (port, accès root) au
+  # cours de cette exécution : il n'a alors pas de copie de l'étape 7, et celle
+  # prise ici en est la version d'après l'étape 7. C'est voulu : ces réglages
+  # ont été appliqués et VÉRIFIÉS (port en écoute) avant d'arriver ici, et la
+  # session de l'utilisateur peut déjà passer par le nouveau port. Un échec du
+  # durcissement ne défait donc que le durcissement, jamais l'étape 7 : le
+  # fichier est ramené à cette version, pas supprimé.
   if ! backup_file_once /etc/ssh/sshd_config ||
      { [[ "$cible" != "/etc/ssh/sshd_config" ]] && ! backup_file_once "$cible"; }; then
     log_err "Sauvegarde de la configuration SSH impossible : durcissement abandonné, rien n'est modifié."
@@ -4367,6 +4439,15 @@ durcir_authentification() {
   # l'utilisateur ayant choisi « aucun filet ». Si l'installation échoue, il
   # n'y a NI minuterie NI commande de secours : on le dit, et on ne continue
   # que sur demande explicite.
+  #
+  # SECTION CRITIQUE : install_ssh_auth_tools arrête la minuterie d'un
+  # durcissement précédent ; jusqu'à l'armement de la nouvelle, une
+  # interruption (Ctrl+C, SIGTERM) laisserait ce durcissement sans aucun filet,
+  # mot de passe coupé. Le mot de passe est alors réactivé sur-le-champ, comme
+  # sur les chemins d'échec ci-dessous. Un redémarrage n'est pas en cause : la
+  # minuterie, transitoire (systemd-run), ne lui survit de toute façon pas ; la
+  # commande ssh-cles-rollback, elle, reste disponible.
+  trap 'reactiver_mot_de_passe_si_orphelin "$cible"; trap - INT TERM; exit 130' INT TERM
   install_ssh_auth_tools "$cible" || outils_ok=0
   if (( ! outils_ok )); then
     log_err "Les outils de retour arrière (ssh-cles-rollback, ssh-cles-confirmer) n'ont pas pu être installés."
@@ -4379,6 +4460,7 @@ durcir_authentification() {
       # Si un durcissement précédent a perdu sa minuterie dans l'opération,
       # son mot de passe est réactivé tout de suite.
       reactiver_mot_de_passe_si_orphelin "$cible"
+      trap - INT TERM
       return 0
     fi
     delai=0
@@ -4398,12 +4480,16 @@ durcir_authentification() {
       if ! ask_yes_no "Désactiver le mot de passe SANS filet de sécurité ?" "n"; then
         log_info "Authentification par mot de passe conservée."
         reactiver_mot_de_passe_si_orphelin "$cible"
+        trap - INT TERM
         return 0
       fi
     fi
   else
     log_warn "Aucun filet de sécurité : gardez impérativement cette session ouverte."
   fi
+  # Fin de la section critique : la nouvelle minuterie est armée, ou l'absence
+  # de filet a été acceptée en connaissance de cause.
+  trap - INT TERM
 
   # --- Modification ---------------------------------------------------------------
   set_sshd_directive "$cible" "PasswordAuthentication" "no"

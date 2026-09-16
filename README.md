@@ -58,7 +58,7 @@ Le script vérifie ensuite ce qui empêche réellement une clé de fonctionner :
 
 `PubkeyAuthentication yes` est posé systématiquement. La désactivation du mot de passe (`PasswordAuthentication no` **et** `KbdInteractiveAuthentication no`, sans quoi la coupure serait illusoire sur Debian) n'est proposée qu'après une connexion par clé prouvée ou une confirmation explicite, et le résultat est vérifié via `sshd -T` — si un fichier de `/etc/ssh/sshd_config.d/` numéroté avant le nôtre l'emporte, le script le nomme au lieu d'annoncer un succès qui n'a pas eu lieu.
 
-Comme pour le changement d'IP, un **retour automatique est armé avant la modification** : sans confirmation dans le délai choisi, le mot de passe est réactivé tout seul.
+Comme pour le changement d'IP, un **retour automatique est armé avant la modification** : sans confirmation dans le délai choisi, le mot de passe est réactivé tout seul. Cette minuterie est transitoire (`systemd-run`) : elle ne survit pas à un redémarrage, contrairement à la commande `ssh-cles-rollback`, toujours disponible.
 
 | Commande | Rôle |
 |---|---|
@@ -201,7 +201,7 @@ The script then checks what actually stops a key from working:
 
 `PubkeyAuthentication yes` is always set. Disabling passwords (`PasswordAuthentication no` **and** `KbdInteractiveAuthentication no`, without which the change would be illusory on Debian) is only offered after a proven key login or an explicit confirmation, and the result is verified through `sshd -T` — if a file in `/etc/ssh/sshd_config.d/` sorting before ours wins, the script names it instead of reporting a success that did not happen.
 
-As with the IP change, an **automatic rollback is armed before the change**: without confirmation within the chosen delay, password authentication is re-enabled on its own.
+As with the IP change, an **automatic rollback is armed before the change**: without confirmation within the chosen delay, password authentication is re-enabled on its own. That timer is transient (`systemd-run`): it does not survive a reboot, unlike the `ssh-cles-rollback` command, which stays available.
 
 | Command | Purpose |
 |---|---|

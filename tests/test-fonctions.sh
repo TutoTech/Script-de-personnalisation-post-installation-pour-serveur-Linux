@@ -255,20 +255,28 @@ ko "aucun processus : SSH ne le tient pas"   ssh_holds_port 22 ""
 # exemptait : un autre service tenant le 22 était accepté, le redémarrage de
 # sshd échouait ensuite.
 TMP_SS="$(mktemp -d)"
-printf '#!/bin/bash\ncat "%s/sortie"\n' "$TMP_SS" > "$TMP_SS/ss"
+# La doublure choisit sa sortie d'après le filtre « sport = :PORT » qu'elle
+# reçoit, comme le vrai ss : une sortie ne concernant pas le port demandé n'est
+# jamais rejouée. Sans fixture pour ce port, rien n'écoute.
+# shellcheck disable=SC2016
+printf '#!/bin/bash\nargs="$*"\nport="${args##*sport = :}"\nf="%s/sortie.$port"\n[ -r "$f" ] && cat "$f"\nexit 0\n' "$TMP_SS" > "$TMP_SS/ss"
 chmod 755 "$TMP_SS/ss"
 # La modification de PATH est volontairement limitée au sous-shell.
 # shellcheck disable=SC2030,SC2031
 v_ssh_port_avec_ss() { ( PATH="$TMP_SS:$PATH"; v_ssh_port "$1" ); }
-printf '%s\n' "$SORTIE_AUTRE" > "$TMP_SS/sortie"
-ko "22 tenu par un autre service : refusé"   v_ssh_port_avec_ss 22
-ko "2222 tenu par un autre service : refusé" v_ssh_port_avec_ss 2222
-printf '%s\n' "$SORTIE_SSHD" > "$TMP_SS/sortie"
-ok "22 tenu par sshd : accepté"              v_ssh_port_avec_ss 22
-ok "2222 tenu par sshd : accepté"            v_ssh_port_avec_ss 2222
-: > "$TMP_SS/sortie"
-ok "22 libre : accepté"                      v_ssh_port_avec_ss 22
-ok "2222 libre : accepté"                    v_ssh_port_avec_ss 2222
+printf '%s\n' "$SORTIE_AUTRE"                > "$TMP_SS/sortie.22"
+printf '%s\n' "${SORTIE_AUTRE//:22 /:2222 }" > "$TMP_SS/sortie.2222"
+ko "22 tenu par un autre service : refusé"    v_ssh_port_avec_ss 22
+ko "2222 tenu par un autre service : refusé"  v_ssh_port_avec_ss 2222
+rm -f "$TMP_SS/sortie.2222"
+ok "2222 libre alors que 22 est occupé : accepté (filtre par port)" v_ssh_port_avec_ss 2222
+printf '%s\n' "$SORTIE_SSHD"                 > "$TMP_SS/sortie.22"
+printf '%s\n' "${SORTIE_SSHD//:22 /:2222 }"  > "$TMP_SS/sortie.2222"
+ok "22 tenu par sshd : accepté"               v_ssh_port_avec_ss 22
+ok "2222 tenu par sshd : accepté"             v_ssh_port_avec_ss 2222
+rm -f "$TMP_SS/sortie.22" "$TMP_SS/sortie.2222"
+ok "22 libre : accepté"                       v_ssh_port_avec_ss 22
+ok "2222 libre : accepté"                     v_ssh_port_avec_ss 2222
 rm -rf "$TMP_SS"
 
 echo "== ssh_pubkey_b64_prefix (entête base64 déduite du type) =="
@@ -442,6 +450,50 @@ egal "aucun fichier temporaire laissé"     "0" "$(find "$TMP_ETAT" -name 'rollb
 NET_BACKUP_MODE=0
 rm -rf "$TMP_ETAT"
 
+echo "== etat_bascule_sans_ecriture / bascule_ip_en_attente =="
+TMP_SE="$(mktemp -d)"
+# Lues par bascule_ip_en_attente.
+# shellcheck disable=SC2034
+STATE_DIR="$TMP_SE" ROLLBACK_STATE="$TMP_SE/rollback.env"
+# shellcheck disable=SC2034
+CONFIRMED_FLAG="$TMP_SE/confirmed" RUNTIME_CONFIRMED_FLAG="$TMP_SE/confirmed.run"
+etat_test() {  # fichier, manifeste, liste générée, fichiers générés, NM modifié, CIDR
+  printf 'NET_CIDR=%q\nBACKUP_MANIFEST=%q\nGENERATED_LIST=%q\nNET_GENERATED_FILES=%q\nNET_NM_MODIFIED=%q\n' \
+    "$6" "$2" "$3" "$4" "$5" > "$1"
+}
+: > "$TMP_SE/manifest.vide"
+: > "$TMP_SE/gen.vide"
+printf '%s\t%s\n' /etc/x /etc/x.bak > "$TMP_SE/manifest.plein"
+printf '/etc/y\n' > "$TMP_SE/gen.plein"
+etat_test "$TMP_SE/vide"       "$TMP_SE/manifest.vide"  "$TMP_SE/gen.vide"  ""       0 10.0.0.2/24
+etat_test "$TMP_SE/sans-manif" "$TMP_SE/inexistant"     "$TMP_SE/gen.vide"  ""       0 10.0.0.3/24
+etat_test "$TMP_SE/sauvegarde" "$TMP_SE/manifest.plein" "$TMP_SE/gen.vide"  ""       0 10.0.0.4/24
+etat_test "$TMP_SE/genere"     "$TMP_SE/manifest.vide"  "$TMP_SE/gen.plein" ""       0 10.0.0.5/24
+etat_test "$TMP_SE/liste-etat" "$TMP_SE/manifest.vide"  "$TMP_SE/gen.vide"  "/etc/z" 0 10.0.0.6/24
+etat_test "$TMP_SE/nm"         "$TMP_SE/manifest.vide"  "$TMP_SE/gen.vide"  ""       1 10.0.0.7/24
+ok "manifeste et liste vides : sans écriture"        etat_bascule_sans_ecriture "$TMP_SE/vide"
+ok "manifeste inexistant : sans écriture"            etat_bascule_sans_ecriture "$TMP_SE/sans-manif"
+ko "une sauvegarde : écrit"                          etat_bascule_sans_ecriture "$TMP_SE/sauvegarde"
+ko "un fichier généré (journal) : écrit"             etat_bascule_sans_ecriture "$TMP_SE/genere"
+ko "un fichier généré (état) : écrit"                etat_bascule_sans_ecriture "$TMP_SE/liste-etat"
+ko "profil NetworkManager modifié : écrit"           etat_bascule_sans_ecriture "$TMP_SE/nm"
+ko "fichier d'état absent : refusé"                  etat_bascule_sans_ecriture "$TMP_SE/nexiste-pas"
+# État d'une version antérieure (sans NET_NM_MODIFIED) : tenu pour écrit.
+printf 'NET_CIDR=10.0.0.8/24\nBACKUP_MANIFEST=%q\n' "$TMP_SE/manifest.vide" > "$TMP_SE/ancien"
+ko "état d'une version antérieure : tenu pour écrit" etat_bascule_sans_ecriture "$TMP_SE/ancien"
+# Un état sans écriture ne surveille rien, sauf s'il a mis de côté un changement
+# précédent (.precedent) : c'est alors celui-ci qui est en attente.
+cp "$TMP_SE/sauvegarde" "$ROLLBACK_STATE"
+ok "état écrit, non confirmé : en attente"           bascule_ip_en_attente
+: > "$CONFIRMED_FLAG"
+ko "état écrit, confirmé : pas en attente"           bascule_ip_en_attente
+rm -f "$CONFIRMED_FLAG"
+cp "$TMP_SE/vide" "$ROLLBACK_STATE"
+ko "sans écriture, rien mis de côté : pas en attente" bascule_ip_en_attente
+cp "$TMP_SE/sauvegarde" "$TMP_SE/rollback.env.precedent"
+ok "sans écriture, précédent mis de côté : en attente" bascule_ip_en_attente
+rm -rf "$TMP_SE"
+
 echo "== annuler_ecriture_reseau =="
 # Retire les fichiers générés, restaure ceux du manifeste réseau, et renvoie 1
 # si une restauration échoue (le garde-fou de démarrage est alors conservé).
@@ -504,7 +556,7 @@ printf '#!/bin/bash\nexit 0\n' > "$TMP_BIN/logger"
 chmod 755 "$TMP_BIN/nmcli" "$TMP_BIN/logger"
 appliquer_pile_nm() {  # $1 = pile, $2 = profil NetworkManager enregistré dans l'état
   (
-    # shellcheck disable=SC2031
+    # shellcheck disable=SC2030,SC2031
     PATH="$TMP_BIN:$PATH"
     # Lues par la bibliothèque chargée ci-dessous.
     # shellcheck disable=SC2034
@@ -526,6 +578,35 @@ ko "profil vide : nmcli n'est pas appelé"      test -e "$TMP_BIN/appels"
 ko "profil renseigné : échec de nmcli propagé" appliquer_pile_nm networkmanager "0f1e2d3c"
 egal "profil renseigné : « connection up UUID »" "connection up 0f1e2d3c" "$(cat "$TMP_BIN/appels" 2>/dev/null)"
 ko "pile inconnue refusée"                     appliquer_pile_nm inconnue ""
+# charger_etat : un état sans écriture se rabat sur le changement précédent mis
+# de côté (.precedent), le seul à savoir revenir à la configuration d'origine.
+TMP_CE="$(mktemp -d)"
+: > "$TMP_CE/manifest.vide"
+printf '%s\t%s\n' /etc/x /etc/x.bak > "$TMP_CE/manifest.plein"
+printf 'NET_CIDR=%q\nBACKUP_MANIFEST=%q\nNET_NM_MODIFIED=0\n' 10.0.0.9/24 "$TMP_CE/manifest.vide"  > "$TMP_CE/vide"
+printf 'NET_CIDR=%q\nBACKUP_MANIFEST=%q\nNET_NM_MODIFIED=0\n' 10.0.0.1/24 "$TMP_CE/manifest.plein" > "$TMP_CE/plein"
+cidr_charge() {  # $1 = état actif, $2 = état mis de côté (vide : aucun)
+  (
+    # shellcheck disable=SC2030,SC2031
+    PATH="$TMP_BIN:$PATH"
+    # Les outils partent d'un environnement vierge (systemd) : les globales du
+    # script chargé par ces tests ne doivent pas s'y glisser.
+    unset BACKUP_MANIFEST GENERATED_LIST NET_GENERATED_FILES NET_NM_MODIFIED
+    # shellcheck source=/dev/null
+    . "$TMP_COMMON"
+    STATE_FILE="$TMP_CE/rollback.env"
+    cp "$1" "$STATE_FILE"
+    rm -f "$STATE_FILE.precedent"
+    [ -z "$2" ] || cp "$2" "$STATE_FILE.precedent"
+    charger_etat >/dev/null 2>&1 || exit 1
+    printf '%s' "${NET_CIDR:-}"
+  )
+}
+egal "état écrit : lu tel quel"                          "10.0.0.1/24" "$(cidr_charge "$TMP_CE/plein" "")"
+egal "état écrit, précédent présent : lu tel quel"       "10.0.0.1/24" "$(cidr_charge "$TMP_CE/plein" "$TMP_CE/vide")"
+egal "sans écriture, aucun précédent : lu tel quel"      "10.0.0.9/24" "$(cidr_charge "$TMP_CE/vide" "")"
+egal "sans écriture, précédent présent : précédent repris" "10.0.0.1/24" "$(cidr_charge "$TMP_CE/vide" "$TMP_CE/plein")"
+rm -rf "$TMP_CE"
 rm -rf "$TMP_COMMON" "$TMP_BIN"
 
 echo "== run_cmd (propagation du code retour) =="
