@@ -206,9 +206,26 @@ echo "== set_sshd_directive (caractères spéciaux dans la valeur) =="
 # valeur qui en contient doit être écrite telle quelle.
 TMP_SSHD="$(mktemp)"
 printf '#Banner none\n' > "$TMP_SSHD"
-set_sshd_directive "$TMP_SSHD" "Banner" "/etc/issue&net|x"
-egal "« & » et « | » écrits tels quels"  "Banner /etc/issue&net|x" "$(grep -E '^Banner ' "$TMP_SSHD")"
+set_sshd_directive "$TMP_SSHD" "Banner" '/etc/issue&net|x\y'
+egal "« & », « | » et « \ » écrits tels quels" 'Banner /etc/issue&net|x\y' "$(grep -E '^Banner ' "$TMP_SSHD")"
 rm -f "$TMP_SSHD"
+
+echo "== restore_file / sshd_restore_or_remove =="
+# La copie passe par un fichier temporaire : un échec ne supprime jamais
+# l'original. Codes : 0 restauré, 2 sauvegarde absente, 1 copie en échec.
+TMP_RS="$(mktemp)"
+printf 'origine\n' > "$TMP_RS"
+cp "$TMP_RS" "$TMP_RS.bak.$RUN_STAMP"
+printf 'modifie\n' > "$TMP_RS"
+ok   "restauration réussie"                 restore_file "$TMP_RS" "$TMP_RS.bak.$RUN_STAMP"
+egal "contenu d'origine rétabli"            "origine" "$(cat "$TMP_RS")"
+egal "sauvegarde absente : code 2"          "2" "$(restore_file "$TMP_RS" "$TMP_RS-absent"; echo $?)"
+egal "sauvegarde absente : fichier intact"  "origine" "$(cat "$TMP_RS")"
+ok   "sshd_restore_or_remove restaure"      sshd_restore_or_remove "$TMP_RS"
+rm -f "$TMP_RS.bak.$RUN_STAMP"
+ok   "sans sauvegarde : fichier créé par nous, supprimé" sshd_restore_or_remove "$TMP_RS"
+ko   "le fichier n'existe plus"             test -e "$TMP_RS"
+rm -f "$TMP_RS" "$TMP_RS.bak.$RUN_STAMP"
 
 echo "== v_port =="
 ok "22 accepté"                          v_port 22
@@ -341,6 +358,9 @@ allow-hotplug ens18
 iface ens18 inet dhcp
     # commentaire dans la strophe
     metric 100
+iface ens18 inet6 static
+    address 2001:db8::10/64
+    gateway 2001:db8::1
 
 auto ens19 ens18
 iface ens19 inet static
@@ -351,14 +371,16 @@ ok "ens19 mentionnée"                    ifupdown_file_mentions_iface "$TMP_IF"
 ko "ens20 absente"                       ifupdown_file_mentions_iface "$TMP_IF" ens20
 ko "« ens1 » n'est pas un préfixe de ens18" ifupdown_file_mentions_iface "$TMP_IF" ens1
 ok   "strip renvoie 0"                   ifupdown_strip_iface_stanzas "$TMP_IF" ens18
-egal "strophe iface ens18 retirée"       "0" "$(grep -c '^iface ens18' "$TMP_IF")"
+egal "strophe iface ens18 inet retirée"  "0" "$(grep -c '^iface ens18 inet ' "$TMP_IF")"
 egal "options de la strophe retirées"    "0" "$(grep -c 'metric 100' "$TMP_IF")"
+egal "strophe inet6 de ens18 CONSERVÉE"  "1" "$(grep -c '^iface ens18 inet6 static' "$TMP_IF")"
+egal "adresse IPv6 conservée"            "1" "$(grep -c '^    address 2001:db8::10/64' "$TMP_IF")"
 egal "allow-hotplug ens18 retiré"        "0" "$(grep -c '^allow-hotplug' "$TMP_IF")"
 egal "auto ens19 conservé, sans ens18"   "auto ens19" "$(grep -E '^auto ens' "$TMP_IF")"
 egal "strophe lo intacte"                "1" "$(grep -c '^iface lo inet loopback' "$TMP_IF")"
 egal "strophe ens19 intacte"             "1" "$(grep -c '^    address 10.0.0.2/24' "$TMP_IF")"
 egal "ligne source conservée"            "1" "$(grep -c '^source ' "$TMP_IF")"
-ko "ens18 n'est plus mentionnée"         ifupdown_file_mentions_iface "$TMP_IF" ens18
+ko "ens18 n'est plus mentionnée (inet6 seule ne compte pas)" ifupdown_file_mentions_iface "$TMP_IF" ens18
 ko "fichier inexistant refusé"           ifupdown_strip_iface_stanzas "$TMP_IF-absent" ens18
 rm -f "$TMP_IF"
 
@@ -371,6 +393,10 @@ ko "sans défaut : arrêt"                 ask_input_eof "" v_port
 ko "défaut refusé par le validateur : arrêt" ask_input_eof "abc" v_port
 ok "défaut valide : accepté"             ask_input_eof "22" v_port
 ok "vide autorisé : accepté"             ask_input_eof "" "" yes
+# Une dernière ligne SANS saut de ligne final fait échouer « read » alors que la
+# valeur a bien été lue : elle doit primer sur le défaut.
+egal "ligne partielle conservée"         "2222" "$(printf '2222' | ( ask_input "Valeur" "22" v_port >/dev/null 2>&1 && printf '%s' "$ASK_VALUE" ))"
+egal "ligne partielle « o » = oui"       "oui"  "$(printf 'o' | ( ask_yes_no "Q" "n" >/dev/null 2>&1 && echo oui || echo non ))"
 
 echo "== run_cmd (propagation du code retour) =="
 # Non-régression : bash remet $? à 0 après un « if commande ; then » dont la

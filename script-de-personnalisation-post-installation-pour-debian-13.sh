@@ -381,8 +381,11 @@ ask_yes_no() {
   while true; do
     if ! read -r -p "$prompt_str" reply; then
       echo "" >&2
-      log_warn "Entrée standard indisponible : réponse « ${default:-non} » utilisée."
-      reply="${default:-non}"
+      # « read » échoue aussi sur une DERNIÈRE ligne sans saut de ligne final
+      # (printf 'o' | script) : la saisie est alors déjà dans la variable et
+      # ne doit pas être écrasée par la valeur par défaut.
+      [[ -n "$reply" ]] || reply="${default:-non}"
+      log_warn "Entrée standard indisponible : réponse « $reply » utilisée."
     fi
     reply="${reply,,}"
     [[ -z "$reply" ]] && reply="${default,,}"
@@ -428,12 +431,14 @@ ask_input() {
     if ! read -r -p "$shown" value; then
       echo "" >&2
       eof=1
-      value="$default"
+      # Une dernière ligne sans saut de ligne final est lue mais « read »
+      # renvoie quand même un échec : cette saisie prime sur le défaut.
+      [[ -n "$value" ]] || value="$default"
       if [[ -z "$value" && "$allow_empty" != "yes" ]]; then
         log_err "Entrée standard indisponible et aucune valeur par défaut pour « $prompt » : arrêt du script."
         exit 1
       fi
-      log_warn "Entrée standard indisponible : valeur par défaut « ${value:-(vide)} » utilisée."
+      log_warn "Entrée standard indisponible : valeur « ${value:-(vide)} » utilisée."
     fi
 
     [[ -z "$value" ]] && value="$default"
@@ -449,7 +454,7 @@ ask_input() {
 
     if [[ -n "$validator" ]] && ! "$validator" "$value"; then
       if (( eof )); then
-        log_err "Entrée standard indisponible et valeur par défaut « $value » refusée pour « $prompt » : arrêt du script."
+        log_err "Entrée standard indisponible et valeur « $value » refusée pour « $prompt » : arrêt du script."
         exit 1
       fi
       continue
@@ -521,12 +526,22 @@ backup_file_once() {
   backup_file "$src"
 }
 
+# restore_file <fichier> <sauvegarde>
+# Renvoie 0 si la restauration a réussi, 2 si la sauvegarde n'existe pas, 1 si
+# la copie a échoué. La copie passe par un fichier temporaire puis « mv » : une
+# copie qui échoue (disque plein, système en lecture seule) laisse l'original
+# INTACT au lieu de le supprimer d'abord, et « mv » remplace un éventuel lien
+# symbolique par la sauvegarde au lieu d'écrire à travers lui.
 restore_file() {
-  local src="${1:-}" dst="${2:-}"
+  local src="${1:-}" dst="${2:-}" tmp
   [[ -n "$src" && -n "$dst" ]] || return 1
-  [[ -e "$dst" || -L "$dst" ]] || return 1
-  rm -f "$src" 2>/dev/null || true
-  cp -a "$dst" "$src"
+  [[ -e "$dst" || -L "$dst" ]] || return 2
+  tmp="${src}.restauration.$$"
+  if cp -a "$dst" "$tmp" 2>/dev/null && mv -f "$tmp" "$src" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
 }
 
 ################################################################################
@@ -859,19 +874,33 @@ v_ssh_port() {
     log_warn "Le port $port est réservé aux services système et peut entrer en conflit."
     ask_yes_no "  L'utiliser quand même ?" "n" || return 1
   fi
-  # Port déjà occupé ? Le port sur lequel sshd écoute DÉJÀ n'est pas un
-  # conflit : c'est le cas normal d'une nouvelle exécution du script avec le
-  # même choix, que l'ancienne version refusait à tort.
+  # Port déjà occupé ? Le port que SSH tient DÉJÀ n'est pas un conflit : c'est
+  # le cas normal d'une nouvelle exécution du script avec le même choix, que
+  # l'ancienne version refusait à tort. Le contrôle porte sur le processus qui
+  # écoute RÉELLEMENT, pas sur le port « configuré » : sshd arrêté, un autre
+  # service peut très bien occuper ce port-là.
   if [[ "$port" != "22" ]] && command -v ss >/dev/null 2>&1; then
     local listeners
     listeners="$(ss -tlnpH "sport = :$port" 2>/dev/null)"
-    if [[ -n "$listeners" && "$port" != "$(ssh_listen_port)" ]] &&
-       ! grep -q 'users:(("sshd"' <<< "$listeners"; then
+    if [[ -n "$listeners" ]] && ! ssh_holds_port "$port" "$listeners"; then
       log_warn "Le port $port est DÉJÀ utilisé par un autre service sur cette machine."
       return 1
     fi
   fi
   return 0
+}
+
+# ssh_holds_port <port> <sortie de « ss -tlnp »>
+# Vrai si le processus en écoute est sshd lui-même, ou systemd pour le compte
+# de ssh.socket (activation par socket : c'est PID 1 qui tient le port).
+ssh_holds_port() {
+  local port="${1:-}" listeners="${2:-}"
+  grep -q 'users:(("sshd"' <<< "$listeners" && return 0
+  if grep -q 'users:(("systemd"' <<< "$listeners" && ssh_socket_active &&
+     systemctl show ssh.socket --property=Listen --value 2>/dev/null | grep -qE ":${port}( |$)"; then
+    return 0
+  fi
+  return 1
 }
 
 ################################################################################
@@ -1276,16 +1305,19 @@ network_preflight() {
 # donc coexister les deux : le client DHCP repartirait à chaque « ifup », avec
 # deux adresses sur la carte et un /etc/resolv.conf réécrit par le bail.
 #
-# Ces deux fonctions repèrent puis retirent les strophes de NOTRE interface
-# uniquement : lo et les autres cartes ne sont pas touchées, et une ligne
-# « auto eth0 eth1 » n'est pas supprimée, seule la mention de notre interface
-# en est retirée.
+# Ces deux fonctions repèrent puis retirent les strophes IPv4 (« inet ») de
+# NOTRE interface uniquement : lo et les autres cartes ne sont pas touchées, une
+# strophe « inet6 » de la même carte est CONSERVÉE (le script ne configure pas
+# d'IPv6 statique, il n'a aucune raison de défaire celui qui existe), et une
+# ligne « auto eth0 eth1 » n'est pas supprimée, seule la mention de notre
+# interface en est retirée.
 ################################################################################
 ifupdown_file_mentions_iface() {
   local file="${1:-}" iface="${2:-}"
   [[ -f "$file" && -n "$iface" ]] || return 1
   awk -v ifc="$iface" '
-    $1 ~ /^(iface|auto|allow-[a-z]+)$/ {
+    $1 == "iface" && $2 == ifc && $3 == "inet" { found = 1; exit }
+    $1 ~ /^(auto|allow-[a-z]+)$/ {
       for (i = 2; i <= NF; i++) if ($i == ifc) { found = 1; exit }
     }
     END { exit !found }
@@ -1304,7 +1336,7 @@ ifupdown_strip_iface_stanzas() {
       {
         if (est_debut_strophe($0)) {
           skip = 0
-          if ($1 == "iface" && $2 == ifc) { skip = 1; next }
+          if ($1 == "iface" && $2 == ifc && $3 == "inet") { skip = 1; next }
           if ($1 ~ /^(auto|allow-[a-z]+)$/) {
             reste = $1; n = 0
             for (i = 2; i <= NF; i++) if ($i != ifc) { reste = reste " " $i; n++ }
@@ -1421,31 +1453,42 @@ write_ifupdown_config() {
 # systemd-resolved serait activé plus tard, mais la résolution est réellement
 # assurée par configure_dns().
 ################################################################################
+# Fichier .network actuellement appliqué à une interface par systemd-networkd.
+# « networkctl status » nomme le fichier retenu quel que soit le critère de
+# [Match] utilisé (Name=, MACAddress=, Driver=, Path=…) : c'est plus fiable
+# que de relire et d'interpréter les fichiers nous-mêmes. Échec si aucun
+# fichier ne s'applique ou si networkd ne gère pas la carte.
+networkd_current_file() {
+  local iface="${1:-}" f
+  [[ -n "$iface" ]] || return 1
+  command -v networkctl >/dev/null 2>&1 || return 1
+  f="$(networkctl --no-pager status "$iface" 2>/dev/null | awk -F': ' '/^[[:space:]]*Network File:/ { print $2; exit }')"
+  [[ -n "$f" && "$f" != "n/a" ]] || return 1
+  printf '%s' "$f"
+}
+
 write_networkd_config() {
   local iface="${1:-}" cidr="${2:-}" gw="${3:-}" dns="${4:-}"
   local target="/etc/systemd/network/10-${iface}.network"
-  local other name
+  local current
 
   mkdir -p /etc/systemd/network
-  backup_file "$target"
 
-  # systemd-networkd n'applique que le PREMIER fichier .network (ordre lexical)
-  # dont la section [Match] correspond à l'interface. Un fichier classé avant
-  # « 10-<carte>.network » et visant la même carte (« Name=en* » par exemple)
-  # l'emporterait en silence : on prévient plutôt que d'annoncer un succès.
-  for other in /etc/systemd/network/*.network; do
-    [[ -f "$other" && "$other" != "$target" ]] || continue
-    [[ "$(basename "$other")" < "$(basename "$target")" ]] || continue
-    while IFS= read -r name; do
-      # shellcheck disable=SC2053
-      if [[ "$iface" == $name ]]; then
-        log_warn "$other correspond aussi à $iface (Name=$name) et sera lu AVANT $target."
-        echo "  systemd-networkd n'applique qu'un seul fichier par interface : le nôtre" >&2
-        echo "  resterait sans effet. Renommez ou ajustez ce fichier avant la bascule." >&2
-        break
-      fi
-    done < <(awk -F= 'tolower($1) ~ /^[[:space:]]*name[[:space:]]*$/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); n = split($2, a, /[[:space:]]+/); for (i = 1; i <= n; i++) print a[i] }' "$other" 2>/dev/null)
-  done
+  # systemd-networkd n'applique que le PREMIER fichier .network (ordre lexical
+  # des noms, /etc primant sur /run et /usr/lib à nom égal) dont la section
+  # [Match] correspond à l'interface. Si le fichier qu'il retient AUJOURD'HUI
+  # pour la carte est classé avant le nôtre, celui-ci resterait lettre morte :
+  # on refuse d'écrire, plutôt que de proposer une bascule qui n'appliquerait
+  # rien et une confirmation qui ne confirmerait rien.
+  if current="$(networkd_current_file "$iface")" &&
+     [[ "$(basename "$current")" < "$(basename "$target")" ]]; then
+    log_err "systemd-networkd applique déjà « $current » à $iface, et ce nom passe avant « $(basename "$target") »."
+    echo "  Notre configuration serait ignorée. Renommez ou adaptez ce fichier (il gère" >&2
+    echo "  probablement le DHCP de la carte), puis relancez l'étape réseau." >&2
+    return 1
+  fi
+
+  backup_file "$target"
 
   cat > "$target" <<EOF
 # Configuration réseau pour l'interface $iface
@@ -1659,16 +1702,28 @@ configure_dns() {
 # C'est indispensable : si « ifdown » coupait la connexion alors que le script
 # tourne encore dans le shell distant, celui-ci recevrait SIGHUP et « ifup » ne
 # serait jamais exécuté — le serveur resterait hors ligne.
+#
+# Renvoie 1 dès qu'un élément (état, commande, unité) n'a pas pu être installé :
+# « set -e » n'étant pas actif, chaque écriture est contrôlée une à une. Sans
+# ces outils il n'y a AUCUN garde-fou ; l'appelant annule alors la
+# configuration réseau plutôt que de proposer une bascule sans filet.
 ################################################################################
 install_network_tools() {
-  mkdir -p "$STATE_DIR"
+  mkdir -p "$STATE_DIR" || return 1
 
   # Un drapeau de confirmation laissé par une exécution PRÉCÉDENTE désarmerait
   # immédiatement les garde-fous de la bascule qui commence. On repart de zéro.
   rm -f "$CONFIRMED_FLAG" "$RUNTIME_CONFIRMED_FLAG"
 
+  # De même, une minuterie de retour arrière encore armée par une exécution
+  # précédente lirait le NOUVEL état partagé et pourrait défaire, plus tard et
+  # sans prévenir, la configuration qui s'écrit ici. Elle est désarmée avant de
+  # remplacer l'état ; la bascule finale réarme la sienne.
+  systemctl stop ip-fixe-rollback.timer >/dev/null 2>&1 || true
+  systemctl reset-failed ip-fixe-rollback.timer ip-fixe-rollback.service ip-fixe-appliquer.service >/dev/null 2>&1 || true
+
   # --- État persistant partagé par tous les outils -----------------------------
-  cat > "$ROLLBACK_STATE" <<EOF
+  cat > "$ROLLBACK_STATE" <<EOF || return 1
 # État de la bascule IP fixe — généré le $(date)
 NET_STACK='${NET_STACK}'
 NET_IFACE='${INTERFACE}'
@@ -1687,10 +1742,10 @@ CONFIRMED_FLAG='${CONFIRMED_FLAG}'
 RUNTIME_CONFIRMED_FLAG='${RUNTIME_CONFIRMED_FLAG}'
 TEST_DOMAINS='${NET_TEST_DOMAINS[*]}'
 EOF
-  chmod 600 "$ROLLBACK_STATE"
+  chmod 600 "$ROLLBACK_STATE" || return 1
 
   # --- Bibliothèque commune ----------------------------------------------------
-  cat > /usr/local/sbin/ip-fixe-commun <<'COMMON'
+  cat > /usr/local/sbin/ip-fixe-commun <<'COMMON' || return 1
 #!/bin/bash
 # Fonctions partagées par les outils de bascule IP fixe.
 # Généré par le script de personnalisation Debian 13.
@@ -1764,10 +1819,10 @@ tester_connectivite() {
   return 1
 }
 COMMON
-  chmod 755 /usr/local/sbin/ip-fixe-commun
+  chmod 755 /usr/local/sbin/ip-fixe-commun || return 1
 
   # --- Application de la nouvelle configuration --------------------------------
-  cat > /usr/local/sbin/ip-fixe-appliquer <<'APPLY'
+  cat > /usr/local/sbin/ip-fixe-appliquer <<'APPLY' || return 1
 #!/bin/bash
 # Applique la configuration IP fixe préparée par le script de personnalisation.
 # Exécuté par systemd (donc détaché de toute session SSH).
@@ -1785,10 +1840,10 @@ else
 fi
 exit "$rc"
 APPLY
-  chmod 755 /usr/local/sbin/ip-fixe-appliquer
+  chmod 755 /usr/local/sbin/ip-fixe-appliquer || return 1
 
   # --- Retour arrière -----------------------------------------------------------
-  cat > /usr/local/sbin/ip-fixe-rollback <<'ROLLBACK'
+  cat > /usr/local/sbin/ip-fixe-rollback <<'ROLLBACK' || return 1
 #!/bin/bash
 # Restaure la configuration réseau antérieure (retour au DHCP) si le changement
 # d'adresse IP n'a pas été confirmé.
@@ -1852,10 +1907,10 @@ else
 fi
 exit 0
 ROLLBACK
-  chmod 755 /usr/local/sbin/ip-fixe-rollback
+  chmod 755 /usr/local/sbin/ip-fixe-rollback || return 1
 
   # --- Confirmation --------------------------------------------------------------
-  cat > /usr/local/sbin/ip-fixe-confirmer <<'CONFIRM'
+  cat > /usr/local/sbin/ip-fixe-confirmer <<'CONFIRM' || return 1
 #!/bin/bash
 # Confirme définitivement le changement d'adresse IP et désarme tous les
 # mécanismes de retour automatique.
@@ -1881,10 +1936,10 @@ echo "  Le retour automatique au DHCP est désactivé."
 journal "Changement d'IP confirmé par l'administrateur."
 exit 0
 CONFIRM
-  chmod 755 /usr/local/sbin/ip-fixe-confirmer
+  chmod 755 /usr/local/sbin/ip-fixe-confirmer || return 1
 
   # --- Garde-fou au démarrage -----------------------------------------------------
-  cat > /usr/local/sbin/ip-fixe-watchdog <<'WATCHDOG'
+  cat > /usr/local/sbin/ip-fixe-watchdog <<'WATCHDOG' || return 1
 #!/bin/bash
 # Vérifie la connectivité au premier démarrage suivant un changement d'IP.
 # En cas d'échec, restaure automatiquement la configuration précédente.
@@ -1923,9 +1978,9 @@ journal "Démarrage avec l'IP fixe : aucune connectivité après 60 s, retour à
 /usr/local/sbin/ip-fixe-rollback
 exit 0
 WATCHDOG
-  chmod 755 /usr/local/sbin/ip-fixe-watchdog
+  chmod 755 /usr/local/sbin/ip-fixe-watchdog || return 1
 
-  cat > /etc/systemd/system/ip-fixe-watchdog.service <<'UNIT'
+  cat > /etc/systemd/system/ip-fixe-watchdog.service <<'UNIT' || return 1
 [Unit]
 Description=Garde-fou IP fixe (retour automatique au DHCP si le réseau ne répond pas)
 After=network-online.target
@@ -1940,9 +1995,50 @@ RemainAfterExit=no
 WantedBy=multi-user.target
 UNIT
 
-  systemctl daemon-reload >/dev/null 2>&1
-  systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1
+  systemctl daemon-reload >/dev/null 2>&1 || return 1
+  systemctl enable ip-fixe-watchdog.service >/dev/null 2>&1 || return 1
+
+  # Vérification finale : tout ce que les autres étapes et la documentation
+  # supposent présent doit l'être réellement.
+  local f
+  for f in ip-fixe-commun ip-fixe-appliquer ip-fixe-rollback ip-fixe-confirmer ip-fixe-watchdog; do
+    [[ -x "/usr/local/sbin/$f" ]] || return 1
+  done
+  [[ -s "$ROLLBACK_STATE" && -f /etc/systemd/system/ip-fixe-watchdog.service ]] || return 1
   log_ok "Garde-fou de démarrage installé (retour automatique au DHCP si le réseau ne répond pas)."
+  return 0
+}
+
+################################################################################
+# FONCTION : Annulation des fichiers réseau écrits pendant l'étape 5
+################################################################################
+# Appelée quand les outils de retour arrière n'ont pas pu être installés : la
+# configuration en cours d'exécution n'a PAS été touchée (rien n'est appliqué
+# avant la bascule), il suffit donc de retirer les fichiers générés et de
+# remettre en place les sauvegardes du manifeste réseau.
+################################################################################
+annuler_ecriture_reseau() {
+  local f orig sauvegarde
+
+  for f in $NET_GENERATED_FILES; do
+    [[ -n "$f" ]] && rm -f "$f"
+  done
+  if [[ -r "$NET_BACKUP_MANIFEST" ]]; then
+    while IFS=$'\t' read -r orig sauvegarde; do
+      [[ -n "${orig:-}" && -n "${sauvegarde:-}" ]] || continue
+      restore_file "$orig" "$sauvegarde" || log_warn "Restauration de $orig impossible : à vérifier à la main."
+    done < "$NET_BACKUP_MANIFEST"
+  fi
+  case "$DNS_METHOD" in
+    resolved)   systemctl restart systemd-resolved >/dev/null 2>&1 || true ;;
+    resolvconf) resolvconf -u >/dev/null 2>&1 || true ;;
+  esac
+  if [[ "$NET_STACK" == "networkmanager" ]]; then
+    nmcli connection reload >/dev/null 2>&1 || true
+  fi
+  NET_GENERATED_FILES=""
+  DHCPCD_NOHOOK_ADDED=0
+  log_ok "Fichiers réseau restaurés dans leur état antérieur."
   return 0
 }
 
@@ -2095,20 +2191,33 @@ set_sshd_directive() {
 ################################################################################
 # FONCTION : Restauration d'un fichier sshd, ou suppression s'il est de nous
 ################################################################################
-# Restaure le fichier depuis la sauvegarde de l'exécution courante ; à défaut
-# (le fichier n'existait pas avant, c'est le script qui l'a créé), le supprime.
+# Restaure le fichier depuis la sauvegarde de l'exécution courante. Si cette
+# sauvegarde n'existe PAS, c'est que le fichier n'existait pas avant : le script
+# l'a créé, il le supprime. Si la sauvegarde existe mais que la copie échoue
+# (disque plein…), le fichier est laissé en place et l'échec signalé : le
+# supprimer aussi dans ce cas aurait effacé un fichier d'inclusion préexistant.
 # Le fichier PRINCIPAL n'est JAMAIS supprimé : sans sauvegarde, mieux vaut un
 # sshd_config à vérifier à la main qu'un sshd privé de toute configuration.
 ################################################################################
 sshd_restore_or_remove() {
-  local file="${1:-}"
+  local file="${1:-}" rc=0
   [[ -n "$file" ]] || return 1
-  restore_file "$file" "${file}.bak.${RUN_STAMP}" && return 0
-  if [[ "$file" == "/etc/ssh/sshd_config" ]]; then
-    log_err "Aucune sauvegarde de /etc/ssh/sshd_config pour cette exécution : fichier laissé en place, à vérifier à la main."
-    return 1
-  fi
-  rm -f "$file"
+  restore_file "$file" "${file}.bak.${RUN_STAMP}" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2)
+      if [[ "$file" == "/etc/ssh/sshd_config" ]]; then
+        log_err "Aucune sauvegarde de /etc/ssh/sshd_config pour cette exécution : fichier laissé en place, à vérifier à la main."
+        return 1
+      fi
+      rm -f "$file"
+      return 0
+      ;;
+    *)
+      log_err "Restauration de $file impossible (copie en échec) : fichier laissé en place, à vérifier à la main."
+      return 1
+      ;;
+  esac
 }
 
 ################################################################################
@@ -2656,16 +2765,16 @@ install_ssh_auth_tools() {
   # garde-fou qui commence.
   rm -f "$SSH_AUTH_CONFIRMED_FLAG"
 
-  cat > "$SSH_AUTH_STATE" <<EOF
+  cat > "$SSH_AUTH_STATE" <<EOF || return 1
 # État du durcissement SSH — généré le $(date)
 SSHD_TARGET='${target}'
 SSHD_TARGET_BACKUP='${target}.bak.${RUN_STAMP}'
 SSHD_MAIN_BACKUP='/etc/ssh/sshd_config.bak.${RUN_STAMP}'
 CONFIRMED_FLAG='${SSH_AUTH_CONFIRMED_FLAG}'
 EOF
-  chmod 600 "$SSH_AUTH_STATE"
+  chmod 600 "$SSH_AUTH_STATE" || return 1
 
-  cat > /usr/local/sbin/ssh-cles-rollback <<'ROLLBACK'
+  cat > /usr/local/sbin/ssh-cles-rollback <<'ROLLBACK' || return 1
 #!/bin/bash
 # Réactive l'authentification par mot de passe tant que le durcissement n'a pas
 # été confirmé. Généré par le script de personnalisation Debian 13.
@@ -2721,9 +2830,9 @@ else
 fi
 exit 0
 ROLLBACK
-  chmod 755 /usr/local/sbin/ssh-cles-rollback
+  chmod 755 /usr/local/sbin/ssh-cles-rollback || return 1
 
-  cat > /usr/local/sbin/ssh-cles-confirmer <<'CONFIRM'
+  cat > /usr/local/sbin/ssh-cles-confirmer <<'CONFIRM' || return 1
 #!/bin/bash
 # Valide le durcissement SSH et désarme le retour automatique.
 # Généré par le script de personnalisation Debian 13.
@@ -2747,8 +2856,11 @@ echo "✓ Durcissement confirmé : l'authentification par mot de passe reste dé
 echo "  Pour la réactiver plus tard : sudo ssh-cles-rollback"
 exit 0
 CONFIRM
-  chmod 755 /usr/local/sbin/ssh-cles-confirmer
+  chmod 755 /usr/local/sbin/ssh-cles-confirmer || return 1
 
+  # Vérification finale : « set -e » n'étant pas actif, chaque écriture a été
+  # contrôlée ; on s'assure en plus que tout ce qui sera annoncé existe.
+  [[ -s "$SSH_AUTH_STATE" && -x /usr/local/sbin/ssh-cles-rollback && -x /usr/local/sbin/ssh-cles-confirmer ]] || return 1
   return 0
 }
 
@@ -3047,7 +3159,7 @@ generer_paire_cles() {
   echo "                 jamais le jeton, qui doit être branché MAINTENANT."
   echo ""
   if ! read -r -p "Votre choix (1/2/3/4) [1] : " choix; then
-    choix="1"
+    [[ -n "$choix" ]] || choix="1"
     echo ""
   fi
   case "${choix:-1}" in
@@ -3081,7 +3193,7 @@ generer_paire_cles() {
     echo "  3. Annuler la génération"
     echo ""
     if ! read -r -p "Votre choix (1/2/3) [1] : " choix; then
-      choix="3"
+      [[ -n "$choix" ]] || choix="3"
       echo ""
     fi
     case "${choix:-1}" in
@@ -3431,7 +3543,7 @@ installer_cle_publique() {
     echo "  0. Terminer la saisie (${#PUBKEYS_COLLECTED[@]} clé(s) retenue(s))"
     echo ""
     if ! read -r -p "Votre choix : " choix; then
-      choix="0"
+      [[ -n "$choix" ]] || choix="0"
       echo ""
     fi
 
@@ -3600,7 +3712,7 @@ installer_cle_publique() {
 # retour arrière automatique armé AVANT la modification.
 ################################################################################
 durcir_authentification() {
-  local cible bin valeur delai choix rc=0
+  local cible bin valeur delai choix rc=0 outils_ok=1
 
   (( AUTHKEY_ADDED )) || return 0
   if ! dpkg -s openssh-server >/dev/null 2>&1; then
@@ -3675,7 +3787,7 @@ durcir_authentification() {
   echo "  4. Aucun filet (déconseillé)"
   echo ""
   if ! read -r -p "Votre choix (1/2/3/4) [2] : " choix; then
-    choix="2"
+    [[ -n "$choix" ]] || choix="2"
     echo ""
   fi
   case "${choix:-2}" in
@@ -3690,8 +3802,23 @@ durcir_authentification() {
   # dans TOUS les cas : sans filet minuté, « sudo ssh-cles-rollback » reste le
   # moyen documenté de revenir en arrière, il doit donc exister. L'ancienne
   # version ne l'installait qu'avec la minuterie, tout en l'indiquant à
-  # l'utilisateur ayant choisi « aucun filet ».
-  install_ssh_auth_tools "$cible" || log_warn "Installation des outils de retour arrière incomplète."
+  # l'utilisateur ayant choisi « aucun filet ». Si l'installation échoue, il
+  # n'y a NI minuterie NI commande de secours : on le dit, et on ne continue
+  # que sur demande explicite.
+  install_ssh_auth_tools "$cible" || outils_ok=0
+  if (( ! outils_ok )); then
+    log_err "Les outils de retour arrière (ssh-cles-rollback, ssh-cles-confirmer) n'ont pas pu être installés."
+    echo "  Sans eux, aucun retour automatique n'est possible et aucune commande de"
+    echo "  secours n'existe : seul un accès console permettrait de rétablir le mot"
+    echo "  de passe en cas de problème."
+    echo ""
+    if ! ask_yes_no "Désactiver le mot de passe SANS aucun filet de sécurité ?" "n"; then
+      log_info "Authentification par mot de passe conservée."
+      return 0
+    fi
+    delai=0
+    SSH_AUTH_ROLLBACK_DELAY=0
+  fi
   if (( delai > 0 )); then
     systemctl stop ssh-cles-rollback.timer >/dev/null 2>&1 || true
     systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
@@ -3753,9 +3880,13 @@ durcir_authentification() {
       echo "  $SSH_AUTH_ROLLBACK_DELAY minutes. Si vous n'arrivez pas à vous"
       echo "  reconnecter : ne faites rien, attendez."
       echo ""
-    else
+    elif (( outils_ok )); then
       echo "  Pour revenir en arrière : sudo ssh-cles-rollback"
       echo "  (ou éditez $cible puis « systemctl reload ssh »)"
+      echo ""
+    else
+      echo "  Pour revenir en arrière : éditez $cible (PasswordAuthentication yes,"
+      echo "  KbdInteractiveAuthentication yes) puis « systemctl reload ssh »."
       echo ""
     fi
   else
@@ -3822,7 +3953,7 @@ while true; do
     echo -e "  ${C_BOLD}3. explication${C_RESET} - Afficher plus de détails"
     echo ""
     if ! read -r -p "$(echo -e "${CURRENT_STEP_COLOR}?${C_RESET} Votre choix : ")" choix; then
-        choix="2"
+        [[ -n "$choix" ]] || choix="2"
         echo ""
     fi
 
@@ -4176,7 +4307,7 @@ if ask_yes_no "Souhaitez-vous configurer une IP fixe ?" "n"; then
     echo "  3. Forcer cette configuration malgré l'échec des tests"
     echo ""
     if ! read -r -p "Votre choix (1/2/3) : " NET_FAIL_CHOICE; then
-      NET_FAIL_CHOICE="2"
+      [[ -n "$NET_FAIL_CHOICE" ]] || NET_FAIL_CHOICE="2"
       echo ""
     fi
 
@@ -4234,28 +4365,39 @@ if ask_yes_no "Souhaitez-vous configurer une IP fixe ?" "n"; then
         log_ok "DNS confié à NetworkManager : $DNS_SERVERS"
       fi
 
-      NET_CONFIGURED=1
-      NET_PENDING_APPLY=1
-
       # Les fichiers sont désormais sur le disque : un redémarrage — ou une
       # interruption du script avant la bascule — suffirait à les appliquer.
       # Le garde-fou de démarrage et les outils de retour arrière sont donc
-      # installés TOUT DE SUITE, et non au seul moment de la bascule.
-      install_network_tools
+      # installés TOUT DE SUITE, et non au seul moment de la bascule. S'ils ne
+      # peuvent pas l'être, la configuration est ANNULÉE : sans filet, une IP
+      # fixe serait un pari.
+      if install_network_tools; then
+        NET_CONFIGURED=1
+        NET_PENDING_APPLY=1
 
-      echo ""
-      log_ok "CONFIGURATION RÉSEAU ENREGISTRÉE (pas encore appliquée)"
-      echo ""
-      echo "Récapitulatif :"
-      echo "  Gestionnaire : $(net_stack_label "$NET_STACK")"
-      echo "  Interface    : $INTERFACE"
-      echo "  IP fixe      : $STATIC_IP"
-      echo "  Passerelle   : $GATEWAY"
-      echo "  DNS          : $DNS_SERVERS"
-      echo ""
-      echo "⚠  La bascule sera proposée à la FIN du script, pour que votre"
-      echo "   session SSH actuelle reste utilisable jusqu'au bout."
-      echo ""
+        echo ""
+        log_ok "CONFIGURATION RÉSEAU ENREGISTRÉE (pas encore appliquée)"
+        echo ""
+        echo "Récapitulatif :"
+        echo "  Gestionnaire : $(net_stack_label "$NET_STACK")"
+        echo "  Interface    : $INTERFACE"
+        echo "  IP fixe      : $STATIC_IP"
+        echo "  Passerelle   : $GATEWAY"
+        echo "  DNS          : $DNS_SERVERS"
+        echo ""
+        echo "⚠  La bascule sera proposée à la FIN du script, pour que votre"
+        echo "   session SSH actuelle reste utilisable jusqu'au bout."
+        echo ""
+      else
+        echo ""
+        log_err "Les outils de bascule et de retour arrière n'ont pas pu être installés."
+        echo "  Sans garde-fou, appliquer une IP fixe serait un pari : la configuration"
+        echo "  réseau est annulée et les fichiers écrits sont remis dans leur état"
+        echo "  antérieur. Le serveur conserve sa configuration actuelle."
+        annuler_ecriture_reseau
+        SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+        echo ""
+      fi
     else
       log_err "La configuration réseau n'a pas pu être écrite."
       echo "  Le système reste dans sa configuration actuelle."
@@ -4298,7 +4440,8 @@ echo ""
 
 while true; do
   if ! read -r -p "Nom de l'utilisateur (laissez vide pour ignorer) : " STANDARD_USER; then
-    STANDARD_USER=""
+    # Entrée fermée : la variable garde la dernière ligne lue (même sans saut
+    # de ligne final) ou reste vide, ce qui revient à ignorer l'étape.
     echo ""
   fi
 
@@ -4461,7 +4604,7 @@ if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
     echo "3. Ne rien modifier (Garder la config actuelle)"
     echo ""
     if ! read -r -p "Votre choix (1/2/3) : " ROOT_LOGIN_CHOICE; then
-      ROOT_LOGIN_CHOICE="3"
+      [[ -n "$ROOT_LOGIN_CHOICE" ]] || ROOT_LOGIN_CHOICE="3"
       echo ""
     fi
 
@@ -4625,7 +4768,7 @@ while true; do
     echo -e "  ${C_BOLD}5. Explication${C_RESET} (à quoi sert une clé, comment ça marche)"
     echo ""
     if ! read -r -p "$(echo -e "${CURRENT_STEP_COLOR}?${C_RESET} Votre choix : ")" SSH_ROLE_CHOICE; then
-        SSH_ROLE_CHOICE="4"
+        [[ -n "$SSH_ROLE_CHOICE" ]] || SSH_ROLE_CHOICE="4"
         echo ""
     fi
 
@@ -4889,7 +5032,7 @@ if (( NET_PENDING_APPLY )); then
   echo ""
 
   if ! read -r -p "Votre choix (1/2) : " APPLY_CHOICE; then
-    APPLY_CHOICE="2"
+    [[ -n "$APPLY_CHOICE" ]] || APPLY_CHOICE="2"
     echo ""
   fi
 
@@ -4906,7 +5049,7 @@ if (( NET_PENDING_APPLY )); then
     echo "  3. 15 minutes"
     echo ""
     if ! read -r -p "Votre choix (1/2/3) : " DELAY_CHOICE; then
-      DELAY_CHOICE="2"
+      [[ -n "$DELAY_CHOICE" ]] || DELAY_CHOICE="2"
       echo ""
     fi
     case "$DELAY_CHOICE" in

@@ -136,9 +136,10 @@ Depuis un compte disposant déjà de `sudo`, préfixez la commande : `sudo ./scr
 ### 🧪 Développement
 
 ```bash
-bash -n script-de-personnalisation-post-installation-pour-debian-13.sh tests/test-fonctions.sh   # syntaxe
+bash -n script-de-personnalisation-post-installation-pour-debian-13.sh   # syntaxe (un fichier par appel :
+bash -n tests/test-fonctions.sh                                          #  bash -n n'analyse que le premier)
 shellcheck -s bash -e SC2317 script-de-personnalisation-post-installation-pour-debian-13.sh tests/test-fonctions.sh
-bash tests/test-fonctions.sh                                                                     # tests unitaires
+bash tests/test-fonctions.sh                                             # tests unitaires
 ```
 
 Les tests chargent le script avec `PERSONNALISATION_SOURCE_ONLY=1`, qui n'expose que les fonctions : rien n'est exécuté et le système n'est jamais modifié.
@@ -266,7 +267,8 @@ From an account that already has `sudo`, prefix it: `sudo ./script-de-personnali
 ### 🧪 Development
 
 ```bash
-bash -n script-de-personnalisation-post-installation-pour-debian-13.sh tests/test-fonctions.sh
+bash -n script-de-personnalisation-post-installation-pour-debian-13.sh   # one file per call: bash -n only
+bash -n tests/test-fonctions.sh                                          #  checks the first argument
 shellcheck -s bash -e SC2317 script-de-personnalisation-post-installation-pour-debian-13.sh tests/test-fonctions.sh
 bash tests/test-fonctions.sh
 ```
