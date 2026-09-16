@@ -1451,8 +1451,14 @@ write_ifupdown_config() {
   fi
 
   if [[ "$target" == "/etc/network/interfaces" ]]; then
-    # Retrait des strophes existantes de CETTE interface uniquement.
-    ifupdown_strip_iface_stanzas "$target" "$iface" || return 1
+    if [[ -f "$target" ]]; then
+      # Retrait des strophes existantes de CETTE interface uniquement.
+      ifupdown_strip_iface_stanzas "$target" "$iface" || return 1
+    else
+      # Pas de fichier principal (pile détectée par le service networking) : il
+      # va être créé, donc déclaré généré pour être retiré à l'annulation.
+      declarer_fichier_genere "$target" || return 1
+    fi
 
     {
       echo ""
@@ -2521,7 +2527,11 @@ activer_coloration() {
         log_ok "Fichier créé"
     else
         log_ok "Fichier .bashrc existant trouvé"
-        backup_file /root/.bashrc
+        if ! backup_file /root/.bashrc; then
+            log_err "Sauvegarde de /root/.bashrc impossible : la coloration n'est pas modifiée."
+            SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+            return 1
+        fi
     fi
 
     write_marked_block /root/.bashrc "$BASHRC_MARK_BEGIN" "$BASHRC_MARK_END" <<'EOF'
@@ -3500,7 +3510,10 @@ configurer_ssh_config() {
   port="$ASK_VALUE"
 
   ensure_ssh_dir "$user" "$home/.ssh" || return 1
-  [[ -e "$cfg" ]] && backup_file_once "$cfg"
+  if [[ -e "$cfg" ]] && ! backup_file_once "$cfg"; then
+    log_err "Sauvegarde de $cfg impossible : l'alias n'est pas écrit."
+    return 1
+  fi
 
   write_marked_block "$cfg" \
     "# >>> personnalisation-debian13 (alias $alias_name) >>>" \
@@ -3675,9 +3688,15 @@ generer_paire_cles() {
     fi
     case "${choix:-1}" in
       2)
-        backup_file "$key_path"
-        backup_file "$pub_path"
-        rm -f "$key_path" "$pub_path"
+        if backup_file "$key_path" && backup_file "$pub_path"; then
+          rm -f "$key_path" "$pub_path"
+        else
+          log_err "Sauvegarde impossible : la clé existante n'est PAS écrasée. Choisissez un autre nom."
+          ask_input "Nouveau nom du fichier de la clé" "${name}-2" v_key_name
+          name="$ASK_VALUE"
+          key_path="$dir/$name"
+          pub_path="$key_path.pub"
+        fi
         ;;
       3)
         log_info "Génération annulée."
@@ -4109,9 +4128,13 @@ installer_cle_publique() {
   authfile="$ssh_dir/authorized_keys"
 
   if [[ -e "$authfile" ]]; then
-    backup_file_once "$authfile"
+    if ! backup_file_once "$authfile"; then
+      log_err "Sauvegarde de $authfile impossible : aucune clé n'est installée."
+      SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+      return 1
+    fi
   else
-    : > "$authfile"
+    : > "$authfile" || { log_err "Création de $authfile impossible."; SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1)); return 1; }
   fi
   ensure_trailing_newline "$authfile"
 
@@ -4586,12 +4609,16 @@ if (( KEYBOARD_OK )); then
   fi
 
   if [ -f /etc/default/keyboard ]; then
-    backup_file /etc/default/keyboard
-    log_info "Configuration permanente du clavier..."
-    if grep -q '^XKBLAYOUT=' /etc/default/keyboard; then
-      sed -i 's/^XKBLAYOUT=.*/XKBLAYOUT="fr"/' /etc/default/keyboard || KEYBOARD_OK=0
+    if ! backup_file /etc/default/keyboard; then
+      log_err "Sauvegarde de /etc/default/keyboard impossible : fichier non modifié."
+      KEYBOARD_OK=0
     else
-      echo 'XKBLAYOUT="fr"' >> /etc/default/keyboard
+      log_info "Configuration permanente du clavier..."
+      if grep -q '^XKBLAYOUT=' /etc/default/keyboard; then
+        sed -i 's/^XKBLAYOUT=.*/XKBLAYOUT="fr"/' /etc/default/keyboard || KEYBOARD_OK=0
+      else
+        echo 'XKBLAYOUT="fr"' >> /etc/default/keyboard || KEYBOARD_OK=0
+      fi
     fi
   else
     log_info "Création de /etc/default/keyboard..."
@@ -4646,18 +4673,25 @@ NEW_HOSTNAME="$ASK_VALUE"
 if [[ -n "$NEW_HOSTNAME" ]]; then
   echo ""
   if run_cmd "Modification du hostname en : $NEW_HOSTNAME" hostnamectl set-hostname "$NEW_HOSTNAME"; then
-    backup_file /etc/hosts
-    log_info "Mise à jour du fichier /etc/hosts..."
-    # Réécriture par awk : le nom n'est jamais interprété comme une expression
-    # régulière ni comme une chaîne de remplacement sed.
-    HOSTS_TMP="$(mktemp)"
-    awk -v h="$NEW_HOSTNAME" '
-      $1 == "127.0.1.1" { print "127.0.1.1\t" h; done = 1; next }
-      { print }
-      END { if (!done) print "127.0.1.1\t" h }
-    ' /etc/hosts > "$HOSTS_TMP" && cat "$HOSTS_TMP" > /etc/hosts
-    rm -f "$HOSTS_TMP"
     HOSTNAME_DONE=1
+    if ! backup_file /etc/hosts; then
+      log_err "Sauvegarde de /etc/hosts impossible : fichier non modifié. Ajoutez-y « 127.0.1.1 $NEW_HOSTNAME » à la main."
+      SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+    else
+      log_info "Mise à jour du fichier /etc/hosts..."
+      # Réécriture par awk : le nom n'est jamais interprété comme une expression
+      # régulière ni comme une chaîne de remplacement sed.
+      HOSTS_TMP="$(mktemp)"
+      if ! awk -v h="$NEW_HOSTNAME" '
+          $1 == "127.0.1.1" { print "127.0.1.1\t" h; done = 1; next }
+          { print }
+          END { if (!done) print "127.0.1.1\t" h }
+        ' /etc/hosts > "$HOSTS_TMP" || ! cat "$HOSTS_TMP" > /etc/hosts; then
+        log_err "Mise à jour de /etc/hosts impossible : vérifiez la ligne « 127.0.1.1 $NEW_HOSTNAME »."
+        SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+      fi
+      rm -f "$HOSTS_TMP"
+    fi
     echo ""
     log_ok "Hostname configuré : $NEW_HOSTNAME"
     echo "  Le nouveau nom sera actif après reconnexion."
@@ -5084,17 +5118,19 @@ while true; do
       # Le répertoire personnel est lu dans la base des comptes, jamais déduit
       # de « /home/<user> » : DHOME peut être changé dans /etc/adduser.conf.
       USER_BASHRC="$(ssh_user_home "$STANDARD_USER" || printf '/home/%s' "$STANDARD_USER")/.bashrc"
-      if [ -f "$USER_BASHRC" ]; then
+      if [ ! -f "$USER_BASHRC" ]; then
+        log_warn "Fichier .bashrc non trouvé, impossible d'activer la coloration."
+      elif ! backup_file "$USER_BASHRC"; then
+        log_err "Sauvegarde de $USER_BASHRC impossible : coloration non modifiée."
+        SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
+      else
         log_info "Activation de la coloration dans $USER_BASHRC..."
-        backup_file "$USER_BASHRC"
         sed -i 's/^#force_color_prompt=yes/force_color_prompt=yes/' "$USER_BASHRC"
         sed -i 's/^#alias ls/alias ls/' "$USER_BASHRC"
         sed -i 's/^#alias grep/alias grep/' "$USER_BASHRC"
         sed -i 's/^#alias fgrep/alias fgrep/' "$USER_BASHRC"
         sed -i 's/^#alias egrep/alias egrep/' "$USER_BASHRC"
         log_ok "Prompt et alias colorés activés pour $STANDARD_USER"
-      else
-        log_warn "Fichier .bashrc non trouvé, impossible d'activer la coloration."
       fi
     fi
     break
