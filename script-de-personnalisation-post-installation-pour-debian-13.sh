@@ -519,8 +519,11 @@ backup_file() {
   # Le manifeste est ce qui rend la sauvegarde EXPLOITABLE par le retour
   # arrière : s'il ne peut pas être écrit, la sauvegarde est réputée échouée et
   # l'appelant ne modifie rien.
+  # Sans manifeste, la copie ne serait jamais retrouvée : elle est retirée pour
+  # ne pas laisser traîner une copie orpheline d'un fichier de configuration.
   if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
     log_err "Impossible de créer $STATE_DIR"
+    rm -f "$dst"
     return 1
   fi
   # Les fichiers sauvegardés pendant l'étape réseau sont en outre listés à part :
@@ -529,10 +532,16 @@ backup_file() {
   # doit jamais être en retard sur le manifeste général.
   if (( NET_BACKUP_MODE )) && ! printf '%s\t%s\n' "$src" "$dst" >> "$NET_BACKUP_MANIFEST"; then
     log_err "Impossible d'inscrire la sauvegarde de $src dans le manifeste réseau"
+    rm -f "$dst"
     return 1
   fi
   if ! printf '%s\t%s\n' "$src" "$dst" >> "$BACKUP_MANIFEST"; then
     log_err "Impossible d'inscrire la sauvegarde de $src dans $BACKUP_MANIFEST"
+    # Hors étape réseau, rien ne référence la copie : retirée. Pendant l'étape
+    # réseau, le manifeste réseau la référence déjà : elle est CONSERVÉE, sinon
+    # le retour arrière la chercherait en vain (le fichier, que l'appelant ne
+    # modifie pas après cet échec, serait restauré à l'identique).
+    (( NET_BACKUP_MODE )) || rm -f "$dst"
     return 1
   fi
   log_ok "Sauvegarde : $dst"
@@ -622,6 +631,8 @@ installer_fichier() {
   if ! cat > "$tmp"; then rm -f "$tmp"; return 1; fi
   if [[ "$verif" == "bash" ]] && ! bash -n "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
   if ! chmod "$mode" "$tmp"; then rm -f "$tmp"; return 1; fi
+  # Un fichier remplacé garde son propriétaire (un renommage ne le transmet pas).
+  if [[ -e "$dest" ]] && ! chown --reference="$dest" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
   if ! mv -f "$tmp" "$dest"; then rm -f "$tmp"; return 1; fi
   return 0
 }
@@ -671,8 +682,16 @@ write_marked_block() {
   content="$(cat)"
   [[ -n "$file" ]] || return 1
   # Un lien symbolique (fichier de démarrage géré ailleurs) est suivi : c'est le
-  # fichier visé qui est réécrit, le lien reste en place.
-  [[ -L "$file" ]] && file="$(readlink -f -- "$file")"
+  # fichier visé qui est réécrit, le lien reste en place. Un lien impossible à
+  # résoudre (répertoire cible absent) est refusé plutôt que d'écrire n'importe où.
+  if [[ -L "$file" ]]; then
+    local cible
+    if ! cible="$(readlink -f -- "$file")" || [[ -z "$cible" ]]; then
+      log_err "Lien symbolique irrésoluble : $file (rien n'est écrit)."
+      return 1
+    fi
+    file="$cible"
+  fi
   [[ -e "$file" ]] || touch "$file" || return 1
 
   n_begin="$(grep -nF -m1 -- "$begin" "$file" 2>/dev/null | cut -d: -f1)"

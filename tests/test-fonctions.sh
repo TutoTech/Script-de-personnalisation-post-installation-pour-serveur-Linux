@@ -205,6 +205,15 @@ egal "le fichier visé porte le bloc"         "1" "$(grep -c '^via le lien$' "$T
 egal "aucun temporaire laissé"               "lien rc" "$(ls -A "$TMP_RCD" | sort | tr '\n' ' ' | sed 's/ $//')"
 rm -rf "$TMP_RCD"
 
+# Lien symbolique irrésoluble (répertoire cible absent) : refusé, rien n'est écrit.
+TMP_RCD="$(mktemp -d)"
+ln -s "$TMP_RCD/inexistant/cible" "$TMP_RCD/lien-casse"
+wmb_lien_casse() { write_marked_block "$TMP_RCD/lien-casse" "# >>> debut >>>" "# <<< fin <<<" <<< "bloc"; }
+ko   "lien irrésoluble : refusé"                          wmb_lien_casse
+ko   "lien irrésoluble : rien n'est créé"                 test -e "$TMP_RCD/inexistant"
+egal "lien irrésoluble : aucun temporaire laissé"         "lien-casse" "$(ls -A "$TMP_RCD")"
+rm -rf "$TMP_RCD"
+
 echo "== set_sshd_directive =="
 TMP_SSHD="$(mktemp)"
 printf '#Port 22\nPermitRootLogin prohibit-password\n' > "$TMP_SSHD"
@@ -225,6 +234,27 @@ printf '#Banner none\n' > "$TMP_SSHD"
 set_sshd_directive "$TMP_SSHD" "Banner" '/etc/issue&net|x\y'
 egal "« & », « | » et « \ » écrits tels quels" 'Banner /etc/issue&net|x\y' "$(grep -E '^Banner ' "$TMP_SSHD")"
 rm -f "$TMP_SSHD"
+
+echo "== backup_file (manifeste inaccessible : pas de copie orpheline) =="
+# Une copie que le manifeste ne référence pas ne serait jamais retrouvée : elle
+# est retirée quand l'inscription échoue (hors étape réseau).
+TMP_BF="$(mktemp -d)"
+printf 'contenu\n' > "$TMP_BF/conf"
+# Lues par backup_file.
+# shellcheck disable=SC2034
+STATE_DIR="$TMP_BF/etat" BACKUP_MANIFEST="$TMP_BF/etat/manifest" NET_BACKUP_MODE=0
+ok   "manifeste accessible : sauvegarde réussie"             backup_file "$TMP_BF/conf"
+ok   "copie présente"                                        test -e "$TMP_BF/conf.bak.$RUN_STAMP"
+egal "copie inscrite au manifeste"                           "1" "$(grep -c "^$TMP_BF/conf"$'\t' "$BACKUP_MANIFEST")"
+rm -f "$TMP_BF/conf.bak.$RUN_STAMP"
+BACKUP_MANIFEST="$TMP_BF/etat/inexistant/manifest"
+ko   "manifeste inaccessible : échec"                        backup_file "$TMP_BF/conf"
+ko   "manifeste inaccessible : aucune copie orpheline"       test -e "$TMP_BF/conf.bak.$RUN_STAMP"
+printf 'x\n' > "$TMP_BF/pas-un-dossier"
+STATE_DIR="$TMP_BF/pas-un-dossier/etat" BACKUP_MANIFEST="$STATE_DIR/manifest"
+ko   "répertoire d'état impossible : échec"                  backup_file "$TMP_BF/conf"
+ko   "répertoire d'état impossible : aucune copie orpheline" test -e "$TMP_BF/conf.bak.$RUN_STAMP"
+rm -rf "$TMP_BF"
 
 echo "== restore_file / sshd_restore_or_remove =="
 # La copie passe par un fichier temporaire : un échec ne supprime jamais
