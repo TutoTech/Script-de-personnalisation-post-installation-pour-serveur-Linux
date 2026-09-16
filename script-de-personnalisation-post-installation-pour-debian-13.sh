@@ -22,21 +22,25 @@
 # -----------------------------------
 # Le changement d'IP est l'opération la plus risquée d'un post-installation :
 # une erreur de saisie peut rendre le serveur totalement injoignable. Ce script
-# applique donc quatre garde-fous :
+# applique donc cinq garde-fous (les mêmes que ceux décrits dans le README) :
 #
-#   1. Il n'écrit RIEN tant que la configuration n'a pas été validée à chaud,
+#   1. Il détecte le gestionnaire réseau déjà en place (ifupdown,
+#      systemd-networkd ou NetworkManager) et écrit DANS celui-ci : aucune
+#      migration de pile, première cause de serveur hors ligne.
+#   2. Il n'écrit RIEN tant que la configuration n'a pas été validée à chaud,
 #      via une adresse IP ajoutée en SECONDAIRE (l'adresse DHCP actuelle reste
 #      active, la session SSH en cours n'est jamais coupée).
-#   2. La validation teste la passerelle, la résolution DNS, puis la
+#   3. La validation teste la passerelle, la résolution DNS, puis la
 #      connectivité sur trois domaines successifs (example.org, debian.org,
 #      cloudflare.com). En cas d'échec des trois, le retour au DHCP est proposé.
-#   3. La bascule réelle n'a lieu qu'à la TOUTE FIN du script, une fois toutes
+#   4. La bascule réelle n'a lieu qu'à la TOUTE FIN du script, une fois toutes
 #      les autres étapes terminées, et elle est exécutée de manière détachée
 #      (systemd-run) pour qu'une coupure SSH ne l'interrompe pas à mi-chemin.
-#   4. Un retour automatique au DHCP est armé avant la bascule : sans
-#      confirmation explicite (« sudo ip-fixe-confirmer ») dans le délai
-#      imparti, le serveur restaure tout seul sa configuration précédente.
-#      Un garde-fou équivalent surveille le premier redémarrage.
+#   5. Un retour automatique au DHCP est armé : sans confirmation explicite
+#      (« sudo ip-fixe-confirmer ») dans le délai imparti, le serveur restaure
+#      tout seul sa configuration précédente. Le garde-fou de démarrage, lui,
+#      est installé DÈS que les fichiers sont écrits (étape 5) : un redémarrage
+#      ou une interruption du script avant la bascule reste couvert.
 #
 # SÉCURITÉ DU DURCISSEMENT SSH
 # ----------------------------
@@ -47,7 +51,8 @@
 # explicite, et un retour automatique est armé — sans « sudo ssh-cles-confirmer »
 # dans le délai imparti, le mot de passe est réactivé tout seul.
 #
-# Prérequis : Accès root (sudo)
+# Prérequis : accès root (session root ou « su - » ; sudo n'est pas installé
+#             par défaut sur Debian 13, le script l'installe à l'étape 6)
 # Compatible : Debian 13 (Trixie) serveur minimal
 #
 ################################################################################
@@ -89,9 +94,11 @@ if [ -z "${PERSONNALISATION_SOURCE_ONLY:-}" ] && [ "$(id -u)" -ne 0 ]; then
   echo "  ERREUR : PRIVILÈGES INSUFFISANTS"
   echo "=========================================="
   echo ""
-  echo "Ce script doit être exécuté avec les privilèges administrateur."
-  echo "Veuillez relancer le script avec la commande :"
-  echo "  sudo $0"
+  echo "Ce script doit être exécuté en tant que root."
+  echo "Sur Debian 13, sudo n'est pas installé par défaut : ouvrez une session"
+  echo "root (ou basculez avec « su - »), puis relancez :"
+  echo "  $0"
+  echo "Depuis un compte disposant déjà de sudo : sudo $0"
   echo ""
   exit 1
 fi
@@ -121,12 +128,14 @@ SSH_ROLE=""              # serveur | client | deux | aucun
 # jamais annoncer un succès qui n'a pas eu lieu.
 COLORATION_DONE=0
 UPDATE_DONE=0
+SKIP_UPDATE=0
 KEYBOARD_DONE=0
 HOSTNAME_DONE=0
 NET_CONFIGURED=0
 NET_PENDING_APPLY=0
 NET_APPLY_MODE=""       # "now" | "reboot"
 USER_CREATED=0
+SUDO_GRANTED=0          # 1 uniquement si l'ajout au groupe sudo a RÉELLEMENT abouti
 SKIP_SSH_CONFIG="false"
 SSH_PORT_APPLIED=0
 SCRIPT_ERRORS=0
@@ -148,6 +157,7 @@ SSH_AUTH_ROLLBACK_DELAY=10
 # --- Contexte réseau détecté ---------------------------------------------------
 NET_STACK=""            # ifupdown | networkd | networkmanager
 NET_NM_CONNECTION=""
+NET_NM_KEYFILE=""       # fichier de profil NetworkManager sauvegardé avant modification
 NET_IFUPDOWN_FILE=""
 NET_GENERATED_FILES=""
 DHCPCD_NOHOOK_ADDED=0
@@ -238,6 +248,19 @@ log_ok()    { printf "${C_OK}✓${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$*"; }
 log_warn()  { printf "${C_WARN}⚠ %s${C_RESET}\n" "$*" >&2; }
 log_err()   { printf "${C_ERR}❌ %s${C_RESET}\n" "$*" >&2; }
 
+################################################################################
+# FONCTION : Longueur d'une chaîne UTF-8 en caractères
+################################################################################
+# Le script tourne en LC_ALL=C : « ${#chaine} » y compte des OCTETS, et un « É »
+# en vaut deux. Les cadres des bannières se décalaient donc d'une colonne par
+# caractère accentué (« CONFIGURATION TERMINÉE », « ÉTAPE 1/8 »...). On compte
+# ici les octets qui ne sont pas des octets de continuation UTF-8 (10xxxxxx),
+# ce qui donne le nombre de caractères quelle que soit la locale.
+################################################################################
+str_len_utf8() {
+  printf '%s' "${1:-}" | tr -d '\200-\277' | wc -c | tr -d ' '
+}
+
 # shellcheck disable=SC2001
 banner() {
   local title="$*"
@@ -261,9 +284,9 @@ banner() {
     CURRENT_STEP_COLOR="$color"
   fi
 
-  local clean_title
+  local clean_title len
   clean_title="$(sed 's/\x1b\[[0-9;]*m//g' <<< "$title")"
-  local len=${#clean_title}
+  len="$(str_len_utf8 "$clean_title")"
   local width=$((len + 6))
   (( width < 50 )) && width=50
 
@@ -382,13 +405,18 @@ ask_yes_no() {
 #
 # Le validateur est le nom d'une fonction qui reçoit la valeur et renvoie 0 si
 # elle est acceptable ; c'est à elle d'expliquer le refus.
+#
+# Entrée standard fermée (script lancé sans terminal) : la valeur par défaut est
+# utilisée. Si elle est vide alors qu'une valeur est requise, ou si le
+# validateur la refuse, le script S'ARRÊTE avec un message : reboucler
+# reviendrait à tourner indéfiniment en répétant le même avertissement.
 ################################################################################
 ask_input() {
   local prompt="${1:-Valeur}"
   local default="${2:-}"
   local validator="${3:-}"
   local allow_empty="${4:-no}"
-  local value shown
+  local value shown eof=0
 
   while true; do
     if [[ -n "$default" ]]; then
@@ -399,8 +427,13 @@ ask_input() {
 
     if ! read -r -p "$shown" value; then
       echo "" >&2
-      log_warn "Entrée standard indisponible : valeur par défaut utilisée."
+      eof=1
       value="$default"
+      if [[ -z "$value" && "$allow_empty" != "yes" ]]; then
+        log_err "Entrée standard indisponible et aucune valeur par défaut pour « $prompt » : arrêt du script."
+        exit 1
+      fi
+      log_warn "Entrée standard indisponible : valeur par défaut « ${value:-(vide)} » utilisée."
     fi
 
     [[ -z "$value" ]] && value="$default"
@@ -415,6 +448,10 @@ ask_input() {
     fi
 
     if [[ -n "$validator" ]] && ! "$validator" "$value"; then
+      if (( eof )); then
+        log_err "Entrée standard indisponible et valeur par défaut « $value » refusée pour « $prompt » : arrêt du script."
+        exit 1
+      fi
       continue
     fi
 
@@ -431,17 +468,31 @@ ask_input() {
 # exploité par le mécanisme de retour arrière.
 #
 # Les liens symboliques sont préservés tels quels (cp -a implique -d).
+#
+# backup_file <fichier> [destination]
+# Par défaut la copie est « <fichier>.bak.<horodatage> », à côté de l'original.
+# Le second argument permet de la placer AILLEURS : indispensable dans les
+# répertoires dont TOUS les fichiers sont lus, où la copie serait prise pour une
+# configuration de plus (interfaces.d inclus par « source …/* », profils
+# NetworkManager dans system-connections/).
 ################################################################################
 backup_file() {
   local src="${1:-}"
-  local dst
+  local dst="${2:-}"
 
   [[ -n "$src" ]] || return 1
   if [[ ! -e "$src" && ! -L "$src" ]]; then
     return 0   # rien à sauvegarder, ce n'est pas une erreur
   fi
 
-  dst="${src}.bak.${RUN_STAMP}"
+  if [[ -n "$dst" ]]; then
+    if ! mkdir -p "$(dirname "$dst")" 2>/dev/null; then
+      log_err "Impossible de créer le répertoire de sauvegarde $(dirname "$dst")"
+      return 1
+    fi
+  else
+    dst="${src}.bak.${RUN_STAMP}"
+  fi
   if ! cp -a "$src" "$dst" 2>/dev/null; then
     log_err "Impossible de sauvegarder $src"
     return 1
@@ -598,7 +649,7 @@ detect_os() {
   if [[ "$OS_VERSION_ID" != "13" ]]; then
     log_warn "Debian détectée en version « ${OS_VERSION_ID:-inconnue} » (${OS_CODENAME:-?}), or ce script cible Debian 13."
     echo "  Les étapes réseau et SSH tiennent compte de spécificités propres à"
-    echo "  Trixie (activation de SSH par socket, dépréciation de « netmask »,"
+    echo "  Trixie (prise en charge de ssh.socket, dépréciation de « netmask »,"
     echo "  absence de systemd-resolved par défaut)."
     echo ""
     if ! ask_yes_no "Continuer quand même ?" "n"; then
@@ -808,10 +859,17 @@ v_ssh_port() {
     log_warn "Le port $port est réservé aux services système et peut entrer en conflit."
     ask_yes_no "  L'utiliser quand même ?" "n" || return 1
   fi
-  if [[ "$port" != "22" ]] && command -v ss >/dev/null 2>&1 &&
-     ss -tlnH "sport = :$port" 2>/dev/null | grep -q .; then
-    log_warn "Le port $port est DÉJÀ utilisé par un autre service sur cette machine."
-    return 1
+  # Port déjà occupé ? Le port sur lequel sshd écoute DÉJÀ n'est pas un
+  # conflit : c'est le cas normal d'une nouvelle exécution du script avec le
+  # même choix, que l'ancienne version refusait à tort.
+  if [[ "$port" != "22" ]] && command -v ss >/dev/null 2>&1; then
+    local listeners
+    listeners="$(ss -tlnpH "sport = :$port" 2>/dev/null)"
+    if [[ -n "$listeners" && "$port" != "$(ssh_listen_port)" ]] &&
+       ! grep -q 'users:(("sshd"' <<< "$listeners"; then
+      log_warn "Le port $port est DÉJÀ utilisé par un autre service sur cette machine."
+      return 1
+    fi
   fi
   return 0
 }
@@ -1210,37 +1268,35 @@ network_preflight() {
 ################################################################################
 
 ################################################################################
-# FONCTION : Configuration statique pour ifupdown
+# FONCTIONS : Strophes ifupdown d'une interface donnée
 ################################################################################
-# Points d'attention propres à Debian 13 :
-#  - « netmask » et « broadcast » sont DÉPRÉCIÉS dans l'ifupdown de Trixie ;
-#    la forme recommandée est la notation CIDR directement dans « address ».
-#  - « dns-nameservers » n'a AUCUN effet si le paquet resolvconf n'est pas
-#    installé (c'est un greffon fourni par ce paquet, pas une option d'ifupdown).
-#    La ligne est écrite pour rester cohérente, mais la résolution DNS est
-#    configurée séparément par configure_dns().
+# ifupdown applique TOUTES les strophes « iface » portant le même nom (c'est
+# ainsi qu'on cumule IPv4 et IPv6, cf. interfaces(5)). Laisser la strophe
+# « inet dhcp » écrite par l'installateur à côté de notre « inet static » ferait
+# donc coexister les deux : le client DHCP repartirait à chaque « ifup », avec
+# deux adresses sur la carte et un /etc/resolv.conf réécrit par le bail.
+#
+# Ces deux fonctions repèrent puis retirent les strophes de NOTRE interface
+# uniquement : lo et les autres cartes ne sont pas touchées, et une ligne
+# « auto eth0 eth1 » n'est pas supprimée, seule la mention de notre interface
+# en est retirée.
 ################################################################################
-write_ifupdown_config() {
-  local iface="${1:-}" cidr="${2:-}" gw="${3:-}" dns="${4:-}"
-  local target tmp
+ifupdown_file_mentions_iface() {
+  local file="${1:-}" iface="${2:-}"
+  [[ -f "$file" && -n "$iface" ]] || return 1
+  awk -v ifc="$iface" '
+    $1 ~ /^(iface|auto|allow-[a-z]+)$/ {
+      for (i = 2; i <= NF; i++) if ($i == ifc) { found = 1; exit }
+    }
+    END { exit !found }
+  ' "$file"
+}
 
-  # Si /etc/network/interfaces inclut le répertoire interfaces.d, on y dépose un
-  # fichier dédié : le fichier principal reste intact et la désinstallation est
-  # triviale.
-  if [[ -d /etc/network/interfaces.d ]] && grep -qE '^[[:space:]]*source(-directory)?[[:space:]]+/etc/network/interfaces\.d' /etc/network/interfaces 2>/dev/null; then
-    target="/etc/network/interfaces.d/10-${iface}"
-  else
-    target="/etc/network/interfaces"
-  fi
-
-  backup_file "$target" || return 1
-
-  if [[ "$target" == "/etc/network/interfaces" ]]; then
-    # Retrait des strophes existantes de CETTE interface uniquement : lo et les
-    # autres interfaces ne doivent pas être touchées. Une ligne « auto eth0 eth1 »
-    # n'est pas supprimée : seule la mention de notre interface en est retirée.
-    tmp="$(mktemp)"
-    awk -v ifc="$iface" '
+ifupdown_strip_iface_stanzas() {
+  local file="${1:-}" iface="${2:-}" tmp
+  [[ -f "$file" && -n "$iface" ]] || return 1
+  tmp="$(mktemp)" || return 1
+  if awk -v ifc="$iface" '
       function est_debut_strophe(l) {
         return (l ~ /^[[:space:]]*(auto|allow-[a-z]+|iface|mapping|source|source-directory|no-auto-down|no-scripts)([[:space:]]|$)/)
       }
@@ -1259,8 +1315,45 @@ write_ifupdown_config() {
         }
         if (!skip) print
       }
-    ' "$target" > "$tmp" && cat "$tmp" > "$target"
+    ' "$file" > "$tmp" && cat "$tmp" > "$file"; then
     rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+################################################################################
+# FONCTION : Configuration statique pour ifupdown
+################################################################################
+# Points d'attention propres à Debian 13 :
+#  - « netmask » et « broadcast » sont DÉPRÉCIÉS dans l'ifupdown de Trixie ;
+#    la forme recommandée est la notation CIDR directement dans « address ».
+#  - « dns-nameservers » n'a AUCUN effet si le paquet resolvconf n'est pas
+#    installé (c'est un greffon fourni par ce paquet, pas une option d'ifupdown).
+#    La ligne est écrite pour rester cohérente, mais la résolution DNS est
+#    configurée séparément par configure_dns().
+#  - L'installateur écrit « source /etc/network/interfaces.d/* » : avec ce
+#    joker, TOUT fichier du répertoire est lu, y compris une copie de
+#    sauvegarde. Les sauvegardes de ce répertoire sont donc rangées ailleurs.
+################################################################################
+write_ifupdown_config() {
+  local iface="${1:-}" cidr="${2:-}" gw="${3:-}" dns="${4:-}"
+  local target other
+
+  # Si /etc/network/interfaces inclut le répertoire interfaces.d, on y dépose un
+  # fichier dédié : la désinstallation est triviale (un fichier à supprimer).
+  if [[ -d /etc/network/interfaces.d ]] && grep -qE '^[[:space:]]*source(-directory)?[[:space:]]+/etc/network/interfaces\.d' /etc/network/interfaces 2>/dev/null; then
+    target="/etc/network/interfaces.d/10-${iface}"
+    backup_file "$target" "$STATE_DIR/network-backups/10-${iface}.bak.${RUN_STAMP}" || return 1
+  else
+    target="/etc/network/interfaces"
+    backup_file "$target" || return 1
+  fi
+
+  if [[ "$target" == "/etc/network/interfaces" ]]; then
+    # Retrait des strophes existantes de CETTE interface uniquement.
+    ifupdown_strip_iface_stanzas "$target" "$iface" || return 1
 
     {
       echo ""
@@ -1276,6 +1369,26 @@ write_ifupdown_config() {
       echo "    dns-nameservers ${dns}"
     } >> "$target"
   else
+    # Les strophes existantes de CETTE interface sont retirées partout où
+    # ifupdown les lirait encore : dans le fichier principal (l'installateur
+    # Debian y écrit « iface <carte> inet dhcp » tout en incluant interfaces.d)
+    # et dans les autres fichiers de interfaces.d. Sans cela, DHCP et statique
+    # seraient appliqués ENSEMBLE (voir ifupdown_strip_iface_stanzas). Chaque
+    # fichier modifié est sauvegardé dans le manifeste réseau : le retour
+    # arrière le restaure à l'identique.
+    if ifupdown_file_mentions_iface /etc/network/interfaces "$iface"; then
+      backup_file /etc/network/interfaces || return 1
+      ifupdown_strip_iface_stanzas /etc/network/interfaces "$iface" || return 1
+      log_info "Strophes existantes de $iface retirées de /etc/network/interfaces (fichier sauvegardé)."
+    fi
+    for other in /etc/network/interfaces.d/*; do
+      [[ -f "$other" && "$other" != "$target" ]] || continue
+      ifupdown_file_mentions_iface "$other" "$iface" || continue
+      backup_file "$other" "$STATE_DIR/network-backups/$(basename "$other").bak.${RUN_STAMP}" || return 1
+      ifupdown_strip_iface_stanzas "$other" "$iface" || return 1
+      log_info "Strophes existantes de $iface retirées de $other (fichier sauvegardé)."
+    done
+
     {
       echo "# Interface $iface : adresse IP fixe"
       echo "# Générée par le script de personnalisation Debian 13 le $(date)"
@@ -1311,9 +1424,28 @@ write_ifupdown_config() {
 write_networkd_config() {
   local iface="${1:-}" cidr="${2:-}" gw="${3:-}" dns="${4:-}"
   local target="/etc/systemd/network/10-${iface}.network"
+  local other name
 
   mkdir -p /etc/systemd/network
   backup_file "$target"
+
+  # systemd-networkd n'applique que le PREMIER fichier .network (ordre lexical)
+  # dont la section [Match] correspond à l'interface. Un fichier classé avant
+  # « 10-<carte>.network » et visant la même carte (« Name=en* » par exemple)
+  # l'emporterait en silence : on prévient plutôt que d'annoncer un succès.
+  for other in /etc/systemd/network/*.network; do
+    [[ -f "$other" && "$other" != "$target" ]] || continue
+    [[ "$(basename "$other")" < "$(basename "$target")" ]] || continue
+    while IFS= read -r name; do
+      # shellcheck disable=SC2053
+      if [[ "$iface" == $name ]]; then
+        log_warn "$other correspond aussi à $iface (Name=$name) et sera lu AVANT $target."
+        echo "  systemd-networkd n'applique qu'un seul fichier par interface : le nôtre" >&2
+        echo "  resterait sans effet. Renommez ou ajustez ce fichier avant la bascule." >&2
+        break
+      fi
+    done < <(awk -F= 'tolower($1) ~ /^[[:space:]]*name[[:space:]]*$/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); n = split($2, a, /[[:space:]]+/); for (i = 1; i <= n; i++) print a[i] }' "$other" 2>/dev/null)
+  done
 
   cat > "$target" <<EOF
 # Configuration réseau pour l'interface $iface
@@ -1368,6 +1500,24 @@ write_nm_config() {
 
   NET_NM_CONNECTION="$con"
   log_info "Profil NetworkManager visé : « $con »"
+
+  # « nmcli connection modify » réécrit le profil SUR LE DISQUE immédiatement.
+  # Sans copie préalable, le retour arrière ne pourrait que deviner l'état
+  # antérieur (« DHCP »), en perdant tout réglage particulier du profil. On
+  # sauvegarde donc le fichier lui-même — HORS de system-connections/, où tout
+  # fichier supplémentaire serait chargé comme un profil de plus.
+  local keyfile
+  keyfile="$(nmcli -t -f NAME,FILENAME connection show 2>/dev/null |
+             awk -F: -v n="$con" '$1 == n { sub(/^[^:]*:/, ""); print; exit }')"
+  if [[ -n "$keyfile" && -f "$keyfile" ]]; then
+    if backup_file "$keyfile" "$STATE_DIR/nm-backups/$(basename "$keyfile").bak.${RUN_STAMP}"; then
+      NET_NM_KEYFILE="$keyfile"
+    else
+      log_warn "Profil « $con » non sauvegardé : le retour arrière repassera simplement en DHCP."
+    fi
+  else
+    log_warn "Fichier du profil « $con » introuvable : le retour arrière repassera simplement en DHCP."
+  fi
 
   if ! nmcli connection modify "$con" \
         ipv4.addresses "$cidr" \
@@ -1527,6 +1677,7 @@ NET_IP='${STATIC_IP_BARE}'
 NET_GATEWAY='${GATEWAY}'
 NET_DNS='${DNS_SERVERS}'
 NET_NM_CONNECTION='${NET_NM_CONNECTION}'
+NET_NM_KEYFILE='${NET_NM_KEYFILE}'
 NET_IFUPDOWN_FILE='${NET_IFUPDOWN_FILE}'
 NET_GENERATED_FILES='${NET_GENERATED_FILES}'
 DHCPCD_NOHOOK_ADDED='${DHCPCD_NOHOOK_ADDED}'
@@ -1579,7 +1730,9 @@ appliquer_pile() {
         dhclient -r "$NET_IFACE" >/dev/null 2>&1
       fi
       pkill -f "dhcpcd.*${NET_IFACE}" >/dev/null 2>&1
-      ip addr flush dev "$NET_IFACE" >/dev/null 2>&1
+      # IPv4 seulement : vider aussi l'IPv6 supprimerait l'adresse de lien
+      # local (fe80::), que « ifup » d'une strophe inet ne recrée pas.
+      ip -4 addr flush dev "$NET_IFACE" >/dev/null 2>&1
       ifup "$NET_IFACE"
       ;;
     networkd)
@@ -1673,9 +1826,16 @@ fi
 
 # 4. Rechargement des démons concernés puis réapplication.
 systemctl daemon-reload >/dev/null 2>&1
-if [ "${NET_STACK:-}" = "networkmanager" ] && [ -n "${NET_NM_CONNECTION:-}" ]; then
-  nmcli connection modify "$NET_NM_CONNECTION" ipv4.method auto \
-        ipv4.addresses "" ipv4.gateway "" ipv4.dns "" ipv4.ignore-auto-dns no >/dev/null 2>&1
+if [ "${NET_STACK:-}" = "networkmanager" ]; then
+  if [ -n "${NET_NM_KEYFILE:-}" ] && [ -f "$NET_NM_KEYFILE" ]; then
+    # Le fichier du profil d'origine vient d'être restauré à l'identique
+    # (étape 2 ci-dessus) : NetworkManager doit simplement le relire.
+    nmcli connection reload >/dev/null 2>&1
+  elif [ -n "${NET_NM_CONNECTION:-}" ]; then
+    # Pas de copie du profil : à défaut de mieux, on repasse en DHCP.
+    nmcli connection modify "$NET_NM_CONNECTION" ipv4.method auto \
+          ipv4.addresses "" ipv4.gateway "" ipv4.dns "" ipv4.ignore-auto-dns no >/dev/null 2>&1
+  fi
 fi
 appliquer_pile
 
@@ -1919,30 +2079,60 @@ set_sshd_directive() {
   fi
 
   if grep -qiE "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]" "$file"; then
-    # La valeur est passée à sed via un fichier de script pour éviter toute
-    # interprétation des caractères spéciaux qu'elle pourrait contenir.
-    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]].*|${key} ${value}|I" "$file"
+    # La valeur est insérée dans la partie « remplacement » de sed, où « \ »,
+    # « & » (rappel du motif) et « | » (délimiteur choisi) ont un sens : ils
+    # sont échappés. Les clés, elles, viennent du script et ne contiennent que
+    # des lettres.
+    local esc="${value//\\/\\\\}"
+    esc="${esc//&/\\&}"
+    esc="${esc//|/\\|}"
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]].*|${key} ${esc}|I" "$file"
   else
     printf '%s %s\n' "$key" "$value" >> "$file"
   fi
 }
 
 ################################################################################
+# FONCTION : Restauration d'un fichier sshd, ou suppression s'il est de nous
+################################################################################
+# Restaure le fichier depuis la sauvegarde de l'exécution courante ; à défaut
+# (le fichier n'existait pas avant, c'est le script qui l'a créé), le supprime.
+# Le fichier PRINCIPAL n'est JAMAIS supprimé : sans sauvegarde, mieux vaut un
+# sshd_config à vérifier à la main qu'un sshd privé de toute configuration.
+################################################################################
+sshd_restore_or_remove() {
+  local file="${1:-}"
+  [[ -n "$file" ]] || return 1
+  restore_file "$file" "${file}.bak.${RUN_STAMP}" && return 0
+  if [[ "$file" == "/etc/ssh/sshd_config" ]]; then
+    log_err "Aucune sauvegarde de /etc/ssh/sshd_config pour cette exécution : fichier laissé en place, à vérifier à la main."
+    return 1
+  fi
+  rm -f "$file"
+}
+
+################################################################################
 # FONCTION : SSH est-il démarré par activation de socket ?
 ################################################################################
-# CHANGEMENT MAJEUR DE DEBIAN 13 : sur une installation neuve, sshd est démarré
-# par « ssh.socket » et non par « ssh.service ». C'est alors la socket qui
-# choisit le port d'écoute : la directive « Port » de sshd_config est purement
-# et simplement IGNORÉE.
+# Debian fournit une unité « ssh.socket » (activation par socket), mais elle
+# n'est PAS activée par défaut : sur une installation neuve, sshd est lancé par
+# ssh.service (cf. README.Debian d'openssh-server ; c'est Ubuntu, depuis 22.10,
+# qui a fait de la socket son mode par défaut). Un administrateur ou une image
+# système peuvent toutefois l'avoir activée (« systemctl enable --now
+# ssh.socket »). Dans ce cas, c'est la socket qui choisit le port d'écoute : la
+# directive « Port » de sshd_config est purement et simplement IGNORÉE, et il
+# faut écrire une surcharge « ListenStream= » dans ssh.socket.d/.
 #
-# L'ancienne version modifiait « Port » puis redémarrait ssh.service, et
-# affichait « configuration appliquée » — alors que le serveur continuait
-# d'écouter sur le port 22.
+# Le mode est donc DÉTECTÉ, jamais supposé. Une socket activée (is-enabled) ou
+# active (is-active) suffit. La propriété « TriggeredBy » de ssh.service n'est
+# plus consultée : elle peut mentionner ssh.socket dès que l'unité est chargée
+# en mémoire, indépendamment de son activation, et n'apporte rien — une socket
+# ni activée ni active ne tient pas le port, ni maintenant ni au prochain
+# démarrage.
 ################################################################################
 ssh_socket_active() {
   systemctl is-enabled --quiet ssh.socket 2>/dev/null && return 0
   systemctl is-active --quiet ssh.socket 2>/dev/null && return 0
-  systemctl show ssh.service -p TriggeredBy --value 2>/dev/null | grep -q 'ssh\.socket' && return 0
   return 1
 }
 
@@ -2048,6 +2238,11 @@ is_ssh_pubkey() {
 ################################################################################
 v_pubkey() {
   local line="${1:-}" type
+
+  # Un copier-coller depuis Windows traîne un retour chariot final : sans
+  # commentaire, il collerait au corps base64 et ferait refuser une clé valide
+  # (ajouter_cle_collectee le retire aussi avant l'installation).
+  line="${line//$'\r'/}"
 
   if [[ "$line" == *"PRIVATE KEY"* || "$line" == *"BEGIN OPENSSH"* ]]; then
     log_err "C'est une clé PRIVÉE — ne la diffusez jamais, et changez-la si elle a circulé."
@@ -3126,7 +3321,7 @@ telecharger_cles() {
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL --proto '=https' --max-time 20 -o "$tmp" -- "$url" || rc=$?
   elif command -v wget >/dev/null 2>&1; then
-    wget -q --timeout=20 -O "$tmp" -- "$url" || rc=$?
+    wget -q --https-only --timeout=20 -O "$tmp" -- "$url" || rc=$?
   else
     log_err "Ni curl ni wget ne sont disponibles : téléchargement impossible."
     rm -f "$tmp"
@@ -3422,7 +3617,7 @@ durcir_authentification() {
   set_sshd_directive "$cible" "PubkeyAuthentication" "yes"
   if ! "$bin" -t 2>/dev/null; then
     log_err "La configuration SSH devient invalide : restauration."
-    restore_file "$cible" "${cible}.bak.${RUN_STAMP}" || rm -f "$cible"
+    sshd_restore_or_remove "$cible"
     SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
     return 1
   fi
@@ -3491,8 +3686,13 @@ durcir_authentification() {
   esac
   SSH_AUTH_ROLLBACK_DELAY="$delai"
 
+  # Les deux commandes (ssh-cles-rollback, ssh-cles-confirmer) sont installées
+  # dans TOUS les cas : sans filet minuté, « sudo ssh-cles-rollback » reste le
+  # moyen documenté de revenir en arrière, il doit donc exister. L'ancienne
+  # version ne l'installait qu'avec la minuterie, tout en l'indiquant à
+  # l'utilisateur ayant choisi « aucun filet ».
+  install_ssh_auth_tools "$cible" || log_warn "Installation des outils de retour arrière incomplète."
   if (( delai > 0 )); then
-    install_ssh_auth_tools "$cible" || log_warn "Installation des outils de retour arrière incomplète."
     systemctl stop ssh-cles-rollback.timer >/dev/null 2>&1 || true
     systemctl reset-failed ssh-cles-rollback.timer ssh-cles-rollback.service >/dev/null 2>&1 || true
 
@@ -3522,7 +3722,7 @@ durcir_authentification() {
 
   if ! "$bin" -t 2>/dev/null; then
     log_err "Configuration invalide : restauration immédiate."
-    restore_file "$cible" "${cible}.bak.${RUN_STAMP}" || rm -f "$cible"
+    sshd_restore_or_remove "$cible"
     ssh_reload_config || true
     SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
     return 1
@@ -4037,6 +4237,12 @@ if ask_yes_no "Souhaitez-vous configurer une IP fixe ?" "n"; then
       NET_CONFIGURED=1
       NET_PENDING_APPLY=1
 
+      # Les fichiers sont désormais sur le disque : un redémarrage — ou une
+      # interruption du script avant la bascule — suffirait à les appliquer.
+      # Le garde-fou de démarrage et les outils de retour arrière sont donc
+      # installés TOUT DE SUITE, et non au seul moment de la bascule.
+      install_network_tools
+
       echo ""
       log_ok "CONFIGURATION RÉSEAU ENREGISTRÉE (pas encore appliquée)"
       echo ""
@@ -4137,6 +4343,7 @@ while true; do
 
     if run_cmd "Ajout de $STANDARD_USER au groupe sudo..." usermod -aG sudo "$STANDARD_USER"; then
       USER_CREATED=1
+      SUDO_GRANTED=1
       echo ""
       log_ok "SUCCÈS : Utilisateur $STANDARD_USER créé et ajouté aux administrateurs."
     else
@@ -4146,7 +4353,9 @@ while true; do
 
     echo ""
     if ask_yes_no "Voulez-vous activer la coloration syntaxique pour $STANDARD_USER ?" "o"; then
-      USER_BASHRC="/home/$STANDARD_USER/.bashrc"
+      # Le répertoire personnel est lu dans la base des comptes, jamais déduit
+      # de « /home/<user> » : DHOME peut être changé dans /etc/adduser.conf.
+      USER_BASHRC="$(ssh_user_home "$STANDARD_USER" || printf '/home/%s' "$STANDARD_USER")/.bashrc"
       if [ -f "$USER_BASHRC" ]; then
         log_info "Activation de la coloration dans $USER_BASHRC..."
         backup_file "$USER_BASHRC"
@@ -4226,7 +4435,7 @@ if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
     echo ""
 
     if ssh_socket_active; then
-      echo "ℹ Sur cette Debian 13, SSH est démarré par « ssh.socket »."
+      echo "ℹ Sur cette machine, SSH est démarré par « ssh.socket » (activation par socket)."
       echo "  C'est la socket systemd qui décide du port d'écoute : modifier"
       echo "  seulement « Port » dans sshd_config n'aurait AUCUN effet."
       echo "  Le script écrira donc la surcharge au bon endroit."
@@ -4260,7 +4469,7 @@ if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
       1)
           # Se couper l'accès root sans disposer d'un autre compte, c'est se
           # verrouiller dehors : on prévient explicitement.
-          if (( ! USER_CREATED )) && ! getent group sudo 2>/dev/null | cut -d: -f4 | grep -q '[^[:space:]]'; then
+          if (( ! SUDO_GRANTED )) && ! getent group sudo 2>/dev/null | cut -d: -f4 | grep -q '[^[:space:]]'; then
               log_warn "Aucun utilisateur avec privilèges sudo n'a été détecté sur ce système."
               echo "  Désactiver l'accès root en SSH vous priverait de tout accès distant."
               echo ""
@@ -4305,26 +4514,25 @@ if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
     echo ""
     log_info "Vérification de la syntaxe de la configuration SSH..."
     SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
-    if "$SSHD_BIN" -t 2>/tmp/sshd-test.$$; then
+    SSHD_TEST_LOG="$(mktemp)"
+    if "$SSHD_BIN" -t 2>"$SSHD_TEST_LOG"; then
         log_ok "Configuration SSH syntaxiquement valide."
         SSHD_VALID=1
     else
         SSHD_VALID=0
         log_err "La configuration SSH générée est INVALIDE :"
-        sed -e 's/^/    /' "/tmp/sshd-test.$$" >&2
+        sed -e 's/^/    /' "$SSHD_TEST_LOG" >&2
         echo ""
         log_warn "Restauration de la configuration précédente pour ne pas perdre l'accès SSH."
         if [[ "$SSHD_TARGET" != "/etc/ssh/sshd_config" ]]; then
             # Le fichier d'inclusion est soit restauré depuis sa sauvegarde
             # (s'il préexistait), soit supprimé (si c'est nous qui l'avons créé).
-            if ! restore_file "$SSHD_TARGET" "${SSHD_TARGET}.bak.${RUN_STAMP}"; then
-                rm -f "$SSHD_TARGET"
-            fi
+            sshd_restore_or_remove "$SSHD_TARGET"
         fi
         restore_file /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.${RUN_STAMP}" || true
         SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
     fi
-    rm -f "/tmp/sshd-test.$$"
+    rm -f "$SSHD_TEST_LOG"
 
     if (( SSHD_VALID )); then
         # --- Application du port --------------------------------------------------
@@ -4497,7 +4705,11 @@ elif [[ "$CONFIGURE_IP" == "y" ]]; then
 fi
 
 if (( USER_CREATED )); then
-  echo "  ✓ Utilisateur créé : $STANDARD_USER (avec sudo)"
+  if (( SUDO_GRANTED )); then
+    echo "  ✓ Utilisateur créé : $STANDARD_USER (avec sudo)"
+  else
+    echo "  ⚠ Utilisateur créé : $STANDARD_USER (SANS sudo : l'ajout au groupe a échoué)"
+  fi
 fi
 
 if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
@@ -4508,7 +4720,7 @@ if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
     fi
     # sshd -T donne la configuration EFFECTIVE, en tenant compte des fichiers
     # inclus. Un simple grep du fichier principal passait à côté des surcharges.
-    EFFECTIVE_ROOT="$("$(command -v sshd || echo /usr/sbin/sshd)" -T 2>/dev/null | awk '$1 == "permitrootlogin" { print $2; exit }')"
+    EFFECTIVE_ROOT="$(sshd_effective permitrootlogin)"
     case "${EFFECTIVE_ROOT:-}" in
         no)                    echo "  ✓ Accès root SSH : DÉSACTIVÉ (Sécurisé)" ;;
         yes)                   echo "  ⚠ Accès root SSH : AUTORISÉ (DANGEREUX)" ;;
@@ -4681,7 +4893,8 @@ if (( NET_PENDING_APPLY )); then
     echo ""
   fi
 
-  install_network_tools
+  # Les outils de bascule et le garde-fou de démarrage ont été installés à
+  # l'étape 5, dès l'écriture des fichiers (voir install_network_tools).
 
   if [[ "$APPLY_CHOICE" == "1" ]]; then
     NET_APPLY_MODE="now"
@@ -4746,6 +4959,9 @@ if (( NET_PENDING_APPLY )); then
 
       # La bascule est confiée à systemd : détachée de cette session SSH, elle
       # ira jusqu'au bout même si la connexion tombe pendant l'opération.
+      # Une unité du même nom restée en échec (exécution précédente) ferait
+      # refuser le lancement : on l'efface d'abord.
+      systemctl reset-failed ip-fixe-appliquer.service >/dev/null 2>&1 || true
       if systemd-run --unit=ip-fixe-appliquer --collect \
            --description="Application de la configuration IP fixe" \
            /usr/local/sbin/ip-fixe-appliquer >/dev/null 2>&1; then

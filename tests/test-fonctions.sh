@@ -201,6 +201,15 @@ egal "directive absente ajoutée"         "MaxAuthTries 3" "$(grep -E '^MaxAuthT
 egal "aucune duplication de Port"        "1" "$(grep -c '^Port ' "$TMP_SSHD")"
 rm -f "$TMP_SSHD"
 
+echo "== set_sshd_directive (caractères spéciaux dans la valeur) =="
+# « & », « | » et « \ » ont un sens dans la partie remplacement de sed : une
+# valeur qui en contient doit être écrite telle quelle.
+TMP_SSHD="$(mktemp)"
+printf '#Banner none\n' > "$TMP_SSHD"
+set_sshd_directive "$TMP_SSHD" "Banner" "/etc/issue&net|x"
+egal "« & » et « | » écrits tels quels"  "Banner /etc/issue&net|x" "$(grep -E '^Banner ' "$TMP_SSHD")"
+rm -f "$TMP_SSHD"
+
 echo "== v_port =="
 ok "22 accepté"                          v_port 22
 ok "65535 accepté"                       v_port 65535
@@ -308,6 +317,60 @@ egal "pas de ligne vide en trop"         "1" "$(wc -l < "$TMP_AUTH" | tr -d ' ')
 ensure_trailing_newline "$TMP_AUTH"
 egal "fichier vide laissé vide"          "0" "$(wc -c < "$TMP_AUTH" | tr -d ' ')"
 rm -f "$TMP_AUTH"
+
+echo "== str_len_utf8 (largeur des bannières en LC_ALL=C) =="
+# En LC_ALL=C, ${#chaine} compte des octets : « É » en vaut deux et décalait le
+# cadre des bannières d'une colonne par caractère accentué.
+egal "ASCII"                             "5" "$(str_len_utf8 abcde)"
+egal "accents comptés en caractères"     "9" "$(str_len_utf8 "ÉTAPE 1/8")"
+egal "chaîne vide"                       "0" "$(str_len_utf8 "")"
+
+echo "== ifupdown_file_mentions_iface / ifupdown_strip_iface_stanzas =="
+# ifupdown applique TOUTES les strophes « iface » d'un même nom : la strophe
+# « inet dhcp » de l'installateur doit disparaître quand on écrit la statique,
+# sans toucher à lo ni aux autres cartes.
+TMP_IF="$(mktemp)"
+cat > "$TMP_IF" <<'EOF'
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+# The primary network interface
+allow-hotplug ens18
+iface ens18 inet dhcp
+    # commentaire dans la strophe
+    metric 100
+
+auto ens19 ens18
+iface ens19 inet static
+    address 10.0.0.2/24
+EOF
+ok "ens18 mentionnée"                    ifupdown_file_mentions_iface "$TMP_IF" ens18
+ok "ens19 mentionnée"                    ifupdown_file_mentions_iface "$TMP_IF" ens19
+ko "ens20 absente"                       ifupdown_file_mentions_iface "$TMP_IF" ens20
+ko "« ens1 » n'est pas un préfixe de ens18" ifupdown_file_mentions_iface "$TMP_IF" ens1
+ok   "strip renvoie 0"                   ifupdown_strip_iface_stanzas "$TMP_IF" ens18
+egal "strophe iface ens18 retirée"       "0" "$(grep -c '^iface ens18' "$TMP_IF")"
+egal "options de la strophe retirées"    "0" "$(grep -c 'metric 100' "$TMP_IF")"
+egal "allow-hotplug ens18 retiré"        "0" "$(grep -c '^allow-hotplug' "$TMP_IF")"
+egal "auto ens19 conservé, sans ens18"   "auto ens19" "$(grep -E '^auto ens' "$TMP_IF")"
+egal "strophe lo intacte"                "1" "$(grep -c '^iface lo inet loopback' "$TMP_IF")"
+egal "strophe ens19 intacte"             "1" "$(grep -c '^    address 10.0.0.2/24' "$TMP_IF")"
+egal "ligne source conservée"            "1" "$(grep -c '^source ' "$TMP_IF")"
+ko "ens18 n'est plus mentionnée"         ifupdown_file_mentions_iface "$TMP_IF" ens18
+ko "fichier inexistant refusé"           ifupdown_strip_iface_stanzas "$TMP_IF-absent" ens18
+rm -f "$TMP_IF"
+
+echo "== ask_input (entrée standard fermée) =="
+# Sans terminal, une saisie obligatoire sans valeur par défaut acceptable ne
+# doit pas boucler indéfiniment : le script s'arrête (code non nul). Le sous-
+# shell isole ce « exit » de la suite de tests.
+ask_input_eof() { ( ask_input "Valeur" "${1:-}" "${2:-}" "${3:-no}" ) </dev/null; }
+ko "sans défaut : arrêt"                 ask_input_eof "" v_port
+ko "défaut refusé par le validateur : arrêt" ask_input_eof "abc" v_port
+ok "défaut valide : accepté"             ask_input_eof "22" v_port
+ok "vide autorisé : accepté"             ask_input_eof "" "" yes
 
 echo "== run_cmd (propagation du code retour) =="
 # Non-régression : bash remet $? à 0 après un « if commande ; then » dont la
