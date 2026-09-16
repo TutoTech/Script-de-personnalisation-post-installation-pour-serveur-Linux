@@ -432,6 +432,16 @@ egal "fichier d'origine restauré"            "dhcp" "$(cat "$TMP_ANN/interfaces
 printf '%s\t%s\n' "$TMP_ANN/interfaces" "$TMP_ANN/absent.bak" > "$TMP_ANN/manifest"
 ko   "sauvegarde absente : échec signalé"    annuler_ecriture_reseau
 egal "fichier laissé intact malgré l'échec"  "dhcp" "$(cat "$TMP_ANN/interfaces")"
+# Un fichier à la fois « généré » ET sauvegardé (préexistant réécrit) doit être
+# RESTAURÉ, pas supprimé.
+printf 'ancien\n' > "$TMP_ANN/reecrit"
+cp "$TMP_ANN/reecrit" "$TMP_ANN/reecrit.bak"
+printf 'nouveau\n' > "$TMP_ANN/reecrit"
+printf '%s\t%s\n' "$TMP_ANN/reecrit" "$TMP_ANN/reecrit.bak" > "$TMP_ANN/manifest"
+# shellcheck disable=SC2034
+NET_GENERATED_FILES="$TMP_ANN/reecrit"
+ok   "généré et sauvegardé : annulation réussie" annuler_ecriture_reseau
+egal "généré et sauvegardé : restauré, pas supprimé" "ancien" "$(cat "$TMP_ANN/reecrit")"
 rm -rf "$TMP_ANN"
 
 echo "== ask_input (entrée standard fermée) =="
