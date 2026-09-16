@@ -18,7 +18,7 @@ Le script traite les huit étapes essentielles de la mise en service d'un serveu
 3. **Localisation** : Configuration du clavier en français (**AZERTY**).
 4. **Identité** : Personnalisation du nom d'hôte (hostname), avec validation du format.
 5. **Réseau statique** : Configuration d'une IP fixe **dans le gestionnaire réseau déjà en place**, avec vérification préalable et retour automatique au DHCP en cas de problème.
-6. **Sécurité Utilisateur** : Création d'un utilisateur standard avec privilèges `sudo` pour éviter l'usage de root.
+6. **Sécurité Utilisateur** : Création d'un utilisateur standard et ajout au groupe `sudo`, pour éviter l'usage de root. L'ajout est vérifié : le récapitulatif final signale un compte créé sans `sudo` si cet ajout a échoué.
 7. **Durcissement SSH** : Changement du port d'écoute et configuration de l'accès root. Si SSH est démarré par `ssh.socket` (activation par socket, optionnelle sur Debian), la directive `Port` est ignorée par le système : le script le détecte et écrit alors la surcharge de la socket.
 8. **Authentification par clé** : Génération d'une paire de clés si la machine est un **client**, dépôt d'une clé publique dans `authorized_keys` si c'est un **serveur**, puis durcissement facultatif avec retour automatique en cas de problème.
 
@@ -161,7 +161,7 @@ The script automates eight critical setup steps:
 3. **Localization**: Configures the keyboard layout to French (**AZERTY**).
 4. **Identity**: Customizes the machine's hostname, with format validation.
 5. **Static Networking**: Sets up a static IP address **in whichever network stack is already in place**, with pre-flight verification and automatic DHCP rollback.
-6. **User Security**: Creates a standard non-root user with `sudo` privileges.
+6. **User Security**: Creates a standard non-root user and adds it to the `sudo` group. The addition is verified: the final summary flags an account created without `sudo` if it failed.
 7. **SSH Hardening**: Changes the listening port and configures root login. When SSH is started by `ssh.socket` (socket activation, optional on Debian), the `Port` directive is ignored by the system: the script detects this and overrides the socket instead.
 8. **Key-based authentication**: Generates a key pair when the machine is a **client**, installs a public key into `authorized_keys` when it is a **server**, then optionally hardens `sshd` with an automatic rollback.
 

@@ -2298,17 +2298,18 @@ declarer_fichier_genere() {
 }
 
 ################################################################################
-# FONCTION : Une bascule d'IP précédente est-elle encore sous surveillance ?
+# FONCTION : Une bascule d'IP précédente attend-elle encore sa confirmation ?
 ################################################################################
-# Vrai si un état existe, n'a pas été confirmé, et qu'une minuterie de retour
-# arrière ou le garde-fou de démarrage est encore armé.
+# Vrai si un état existe et n'a jamais été confirmé par ip-fixe-confirmer. Peu
+# importe qu'une minuterie ou le garde-fou de démarrage soient encore armés :
+# le garde-fou se retire de lui-même après un premier démarrage réussi sans
+# rien confirmer, et le changement reste alors réversible à la main
+# (ip-fixe-rollback). Son état ne doit donc pas être écrasé sans le dire.
 ################################################################################
 bascule_ip_en_attente() {
   [[ -r "$ROLLBACK_STATE" ]] || return 1
   [[ ! -e "$CONFIRMED_FLAG" && ! -e "$RUNTIME_CONFIRMED_FLAG" ]] || return 1
-  systemctl is-active --quiet ip-fixe-rollback.timer 2>/dev/null && return 0
-  systemctl is-enabled --quiet ip-fixe-watchdog.service 2>/dev/null && return 0
-  return 1
+  return 0
 }
 
 ################################################################################
@@ -4738,9 +4739,10 @@ echo ""
 # on n'y touche pas.
 NET_STEP_ALLOWED=1
 if bascule_ip_en_attente; then
-  log_warn "Un changement d'adresse IP précédent attend encore sa confirmation."
-  echo "  Ses garde-fous (minuterie de retour arrière ou service de démarrage) sont"
-  echo "  toujours armés. Si cette session passe déjà par la nouvelle adresse :"
+  log_warn "Un changement d'adresse IP précédent n'a jamais été confirmé."
+  echo "  Son retour arrière reste possible (minuterie ou garde-fou de démarrage"
+  echo "  encore armés, ou commande ip-fixe-rollback). Si cette session passe"
+  echo "  déjà par la nouvelle adresse :"
   echo "    sudo ip-fixe-confirmer      (valider le changement précédent)"
   echo "  Sinon :"
   echo "    sudo ip-fixe-rollback       (revenir tout de suite en arrière)"
@@ -5321,6 +5323,7 @@ if [[ "$SKIP_SSH_CONFIG" == "false" ]]; then
 
     if (( SSHD_VALID )); then
         # --- Application du port --------------------------------------------------
+        SOCKET_OVERRIDE_WRITTEN=0
         if ssh_socket_active; then
             log_info "Application du port via la surcharge de ssh.socket..."
             # Sauvegarde exigée AVANT d'écrire, et écriture atomique : sans cela
@@ -5342,6 +5345,7 @@ EOF
                 SOCKET_OVERRIDE_OK=0
             fi
             if (( SOCKET_OVERRIDE_OK )); then
+                SOCKET_OVERRIDE_WRITTEN=1
                 systemctl daemon-reload
                 run_cmd "Redémarrage de ssh.socket..." systemctl restart ssh.socket || true
                 systemctl restart ssh.service >/dev/null 2>&1 || true
@@ -5365,7 +5369,32 @@ EOF
             echo "  Ports actuellement en écoute pour SSH :"
             ss -tlnp 2>/dev/null | grep -iE 'sshd|ssh\.socket' | sed -e 's/^/    /' || echo "    (aucun)"
             echo ""
-            log_warn "Ne fermez PAS votre session actuelle avant d'avoir compris pourquoi."
+            # Une modification qui n'a pas pris maintenant prendrait au prochain
+            # redémarrage de SSH ou de la machine, à l'insu de l'utilisateur : la
+            # configuration précédente est rétablie (fichiers sshd de cette étape,
+            # surcharge de socket), puis SSH est relancé sur son ancien port.
+            log_warn "Rétablissement de la configuration SSH précédente..."
+            SSHD_REVERT_OK=1
+            if (( SOCKET_OVERRIDE_WRITTEN )); then
+                sshd_restore_or_remove /etc/systemd/system/ssh.socket.d/10-port.conf || SSHD_REVERT_OK=0
+                systemctl daemon-reload >/dev/null 2>&1 || true
+            fi
+            if [[ "$SSHD_TARGET" != "/etc/ssh/sshd_config" ]]; then
+                sshd_restore_or_remove "$SSHD_TARGET" || SSHD_REVERT_OK=0
+            fi
+            restore_file /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.${RUN_STAMP}" || SSHD_REVERT_OK=0
+            if ssh_socket_active; then
+                systemctl restart ssh.socket >/dev/null 2>&1 || true
+                systemctl restart ssh.service >/dev/null 2>&1 || true
+            else
+                systemctl restart ssh >/dev/null 2>&1 || true
+            fi
+            if (( SSHD_REVERT_OK )); then
+                log_warn "Configuration SSH précédente rétablie : le changement de port et le réglage de l'accès root de cette étape sont abandonnés."
+            else
+                log_err "Rétablissement incomplet : vérifiez /etc/ssh et /etc/systemd/system/ssh.socket.d à la main (sshd -t)."
+            fi
+            log_warn "Ne fermez PAS votre session actuelle avant d'avoir vérifié « ss -tlnp | grep -i ssh »."
             SCRIPT_ERRORS=$((SCRIPT_ERRORS + 1))
         fi
 
