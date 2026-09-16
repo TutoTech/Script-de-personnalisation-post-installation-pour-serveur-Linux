@@ -944,8 +944,11 @@ v_ssh_port() {
   # le cas normal d'une nouvelle exécution du script avec le même choix, que
   # l'ancienne version refusait à tort. Le contrôle porte sur le processus qui
   # écoute RÉELLEMENT, pas sur le port « configuré » : sshd arrêté, un autre
-  # service peut très bien occuper ce port-là.
-  if [[ "$port" != "22" ]] && command -v ss >/dev/null 2>&1; then
+  # service peut très bien occuper ce port-là. Le port 22 n'y fait pas
+  # exception : tenu par sshd (ou par systemd pour ssh.socket), il passe comme
+  # les autres ; tenu par un autre service, sshd ne pourrait pas s'y lier et le
+  # redémarrage échouerait.
+  if command -v ss >/dev/null 2>&1; then
     local listeners
     listeners="$(ss -tlnpH "sport = :$port" 2>/dev/null)"
     if [[ -n "$listeners" ]] && ! ssh_holds_port "$port" "$listeners"; then
@@ -2235,14 +2238,24 @@ UNIT
   # (voir ecrire_etat_bascule). Publié avant toute écriture, il est sans effet
   # pour les outils : manifeste vide (rien à restaurer), aucun fichier généré
   # (rien à supprimer) et, sous NetworkManager, aucun profil (rien à
-  # réappliquer, voir appliquer_pile). Le drapeau de confirmation de
-  # l'exécution précédente désarmerait immédiatement les nouveaux garde-fous :
-  # retiré.
+  # réappliquer, voir appliquer_pile).
   if ! ecrire_etat_bascule; then
     retablir_etat_precedent
     return 1
   fi
-  rm -f "$CONFIRMED_FLAG" "$RUNTIME_CONFIRMED_FLAG"
+
+  # Le drapeau de confirmation d'une exécution précédente désarmerait
+  # immédiatement les nouveaux garde-fous : le retour arrière et le garde-fou
+  # de démarrage, le voyant, ne restaureraient RIEN. Son retrait est donc
+  # contrôlé, et un échec est fatal AVANT toute écriture réseau. Un arrêt
+  # brutal entre la publication et ce retrait est sans conséquence : l'état
+  # publié ne décrit encore aucune écriture, et une exécution suivante repart
+  # de zéro (une bascule « confirmée » n'est pas en attente).
+  if ! rm -f "$CONFIRMED_FLAG" "$RUNTIME_CONFIRMED_FLAG"; then
+    log_err "Impossible de retirer le drapeau de confirmation d'une exécution précédente ($CONFIRMED_FLAG, $RUNTIME_CONFIRMED_FLAG)."
+    retablir_etat_precedent
+    return 1
+  fi
 
   # L'unité du garde-fou est réaffirmée (l'ancien retour arrière a pu la
   # retirer juste avant d'être arrêté) puis activée.
@@ -3317,9 +3330,16 @@ CONFIRM
     retablir_etat_ssh_precedent
     return 1
   fi
-  # Le drapeau de confirmation de l'exécution précédente désarmerait le
-  # nouveau garde-fou : retiré. L'ancien état n'a plus à être rétabli.
-  rm -f "$SSH_AUTH_CONFIRMED_FLAG" "$precedent"
+  # Le drapeau de confirmation d'un durcissement précédent désarmerait le
+  # nouveau garde-fou (ssh-cles-rollback ne réactiverait PAS le mot de passe) :
+  # son retrait est contrôlé, et un échec est fatal AVANT toute modification
+  # de sshd. Ensuite seulement, l'ancien état n'a plus à être rétabli.
+  if ! rm -f "$SSH_AUTH_CONFIRMED_FLAG"; then
+    log_err "Impossible de retirer le drapeau de confirmation d'un durcissement précédent ($SSH_AUTH_CONFIRMED_FLAG)."
+    retablir_etat_ssh_precedent
+    return 1
+  fi
+  rm -f "$precedent"
   return 0
 }
 
@@ -5372,8 +5392,11 @@ EOF
         fi
 
         # --- Vérification RÉELLE du port d'écoute ---------------------------------
+        # C'est SSH qui doit tenir le port (sshd, ou systemd pour ssh.socket) :
+        # un autre service en écoute sur ce même port ne vaut pas application.
         sleep 1
-        if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${SSH_PORT}\$"; then
+        SSH_PORT_LISTENERS="$(ss -tlnpH "sport = :$SSH_PORT" 2>/dev/null)"
+        if [[ -n "$SSH_PORT_LISTENERS" ]] && ssh_holds_port "$SSH_PORT" "$SSH_PORT_LISTENERS"; then
             SSH_PORT_APPLIED=1
             echo ""
             log_ok "CONFIGURATION SSH APPLIQUÉE — SSH écoute bien sur le port $SSH_PORT."

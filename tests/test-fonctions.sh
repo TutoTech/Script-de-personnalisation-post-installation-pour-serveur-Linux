@@ -244,6 +244,33 @@ CLE_ED25519="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFJM/PVmU6wnjFPK/7WRI6hUDZFEMRD
 CLE_RSA="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCRBwVnwPS0sl0FLV1ZxzyHh920LVCvEdWoM56bYapfCimE2AuYO86N+ok3ovm3nhxRVbyyG6vKGAgWlQylMDd+jzfCrgEomnQJqdeIqv2ZvT+bT8zw85l3u+LITDeGNVJTGXwJzrjLWVYSedkYs1Tci6zlouU//OF5Jp+WYmEZK4M/zLZlXc+bssMvMTOk9C5m7onFDFButTdnIcKg3+CoCTQ2TCPY9ssAc/1d50eg5ivSg2O83uatnfu6rwbMGbjsDkaoO3Hg3pKQwiWP5g3IzwjI/LWNBTDMzL6vGD8E8jqoSOHU5vE/XjN/iKAl+7s+nU4tP45CLy51aScyLc9b admin@poste"
 CLE_ECDSA="ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAEnSrXNITxpNG5sr+3tRA/MmadiXh3rCIcXn8QIj8tDXJ1sBRAhHdhMonZ70KzExCdVcmLy5h2LvTbkXESGiWfnyQB5qAChJpZKIsaY6Ig87lPRNEFSUHCWBEVZ1hNCYxfaJuHWaib0NFC1SwcSX0SqkrzFTWUKrRNovsvQdhiGIybvww== ops@nas"
 
+echo "== ssh_holds_port / v_ssh_port (occupation du port, 22 compris) =="
+SORTIE_SSHD='LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=1,fd=3))'
+SORTIE_AUTRE='LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("nginx",pid=2,fd=6))'
+ok "port tenu par sshd : SSH le tient"       ssh_holds_port 22 "$SORTIE_SSHD"
+ko "port tenu par nginx : SSH ne le tient pas" ssh_holds_port 22 "$SORTIE_AUTRE"
+ko "aucun processus : SSH ne le tient pas"   ssh_holds_port 22 ""
+# « ss » est remplacé par une doublure qui rejoue une sortie choisie : le port
+# 22 doit subir le même contrôle que les autres ports. L'ancien code l'en
+# exemptait : un autre service tenant le 22 était accepté, le redémarrage de
+# sshd échouait ensuite.
+TMP_SS="$(mktemp -d)"
+printf '#!/bin/bash\ncat "%s/sortie"\n' "$TMP_SS" > "$TMP_SS/ss"
+chmod 755 "$TMP_SS/ss"
+# La modification de PATH est volontairement limitée au sous-shell.
+# shellcheck disable=SC2030,SC2031
+v_ssh_port_avec_ss() { ( PATH="$TMP_SS:$PATH"; v_ssh_port "$1" ); }
+printf '%s\n' "$SORTIE_AUTRE" > "$TMP_SS/sortie"
+ko "22 tenu par un autre service : refusé"   v_ssh_port_avec_ss 22
+ko "2222 tenu par un autre service : refusé" v_ssh_port_avec_ss 2222
+printf '%s\n' "$SORTIE_SSHD" > "$TMP_SS/sortie"
+ok "22 tenu par sshd : accepté"              v_ssh_port_avec_ss 22
+ok "2222 tenu par sshd : accepté"            v_ssh_port_avec_ss 2222
+: > "$TMP_SS/sortie"
+ok "22 libre : accepté"                      v_ssh_port_avec_ss 22
+ok "2222 libre : accepté"                    v_ssh_port_avec_ss 2222
+rm -rf "$TMP_SS"
+
 echo "== ssh_pubkey_b64_prefix (entête base64 déduite du type) =="
 egal "ssh-ed25519"    "AAAAC3NzaC1lZDI1NTE5" "$(ssh_pubkey_b64_prefix ssh-ed25519)"
 egal "ssh-rsa"        "AAAAB3NzaC1y"         "$(ssh_pubkey_b64_prefix ssh-rsa)"
@@ -477,6 +504,7 @@ printf '#!/bin/bash\nexit 0\n' > "$TMP_BIN/logger"
 chmod 755 "$TMP_BIN/nmcli" "$TMP_BIN/logger"
 appliquer_pile_nm() {  # $1 = pile, $2 = profil NetworkManager enregistré dans l'état
   (
+    # shellcheck disable=SC2031
     PATH="$TMP_BIN:$PATH"
     # Lues par la bibliothèque chargée ci-dessous.
     # shellcheck disable=SC2034
