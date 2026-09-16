@@ -551,17 +551,54 @@ backup_file_once() {
   backup_file "$src"
 }
 
+# temporaire_pour <fichier>
+# Fichier temporaire au nom imprévisible (mktemp), dans le MÊME répertoire que la
+# cible pour que le « mv » final soit un simple renommage, donc atomique, et
+# préfixé d'un point : ni « source /etc/network/interfaces.d/* » ni
+# « Include /etc/ssh/sshd_config.d/*.conf » ne le lisent entre-temps. Un nom
+# prévisible (« <fichier>.tmp.$$ ») exposerait à une collision entre deux
+# exécutions, ou à un fichier pré-créé à sa place.
+temporaire_pour() {
+  local file="${1:-}"
+  [[ -n "$file" ]] || return 1
+  mktemp "$(dirname -- "$file")/.$(basename -- "$file").XXXXXX" 2>/dev/null
+}
+
+# installer_contenu <fichier> <temporaire>
+# Met en place un contenu préparé dans un temporaire de temporaire_pour : les
+# droits et le propriétaire de l'original sont reportés (un renommage ne les
+# transmet pas), puis « mv » remplace le fichier d'un coup. Une interruption ou
+# un disque plein ne laissent jamais le fichier tronqué, ce que pouvait faire
+# « cat temporaire > fichier ». Le temporaire est supprimé en cas d'échec.
+installer_contenu() {
+  local file="${1:-}" tmp="${2:-}"
+  [[ -n "$file" && -n "$tmp" && -f "$tmp" ]] || return 1
+  if [[ -e "$file" ]]; then
+    if ! chmod --reference="$file" "$tmp" 2>/dev/null || ! chown --reference="$file" "$tmp" 2>/dev/null; then
+      rm -f "$tmp"
+      return 1
+    fi
+  fi
+  if ! mv -f "$tmp" "$file" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
+}
+
 # restore_file <fichier> <sauvegarde>
 # Renvoie 0 si la restauration a réussi, 2 si la sauvegarde n'existe pas, 1 si
-# la copie a échoué. La copie passe par un fichier temporaire puis « mv » : une
-# copie qui échoue (disque plein, système en lecture seule) laisse l'original
-# INTACT au lieu de le supprimer d'abord, et « mv » remplace un éventuel lien
-# symbolique par la sauvegarde au lieu d'écrire à travers lui.
+# la copie a échoué. La copie passe par un fichier temporaire (temporaire_pour)
+# puis « mv » : une copie qui échoue (disque plein, système en lecture seule)
+# laisse l'original INTACT au lieu de le supprimer d'abord, et « mv » remplace
+# un éventuel lien symbolique par la sauvegarde au lieu d'écrire à travers lui.
+# « cp -a » reporte sur le temporaire les droits et le propriétaire de la
+# sauvegarde, donc de l'original.
 restore_file() {
   local src="${1:-}" dst="${2:-}" tmp
   [[ -n "$src" && -n "$dst" ]] || return 1
   [[ -e "$dst" || -L "$dst" ]] || return 2
-  tmp="${src}.restauration.$$"
+  tmp="$(temporaire_pour "$src")" || return 1
   if cp -a "$dst" "$tmp" 2>/dev/null && mv -f "$tmp" "$src" 2>/dev/null; then
     return 0
   fi
@@ -633,26 +670,35 @@ write_marked_block() {
 
   content="$(cat)"
   [[ -n "$file" ]] || return 1
-  [[ -e "$file" ]] || touch "$file"
+  # Un lien symbolique (fichier de démarrage géré ailleurs) est suivi : c'est le
+  # fichier visé qui est réécrit, le lien reste en place.
+  [[ -L "$file" ]] && file="$(readlink -f -- "$file")"
+  [[ -e "$file" ]] || touch "$file" || return 1
 
   n_begin="$(grep -nF -m1 -- "$begin" "$file" 2>/dev/null | cut -d: -f1)"
   n_end="$(grep -nF -m1 -- "$end" "$file" 2>/dev/null | cut -d: -f1)"
 
+  # Le nouveau contenu est préparé EN ENTIER dans un temporaire du même
+  # répertoire, puis mis en place d'un coup (installer_contenu) : une
+  # interruption ou un disque plein ne laissent ni fichier tronqué, ni bloc à
+  # moitié écrit.
+  tmp="$(temporaire_pour "$file")" || return 1
   if [[ -n "$n_begin" && -n "$n_end" ]] && (( n_end > n_begin )); then
-    tmp="$(mktemp)"
-    awk -v s="$n_begin" -v e="$n_end" 'NR < s || NR > e' "$file" > "$tmp" && cat "$tmp" > "$file"
-    rm -f "$tmp"
-  elif [[ -n "$n_begin" || -n "$n_end" ]]; then
-    log_warn "Bloc géré incomplet dans $file (marqueur de début ou de fin manquant)."
-    echo "  Par sécurité, rien n'est supprimé : un nouveau bloc est ajouté à la suite." >&2
-    echo "  Vous pouvez retirer l'ancien à la main si nécessaire." >&2
+    awk -v s="$n_begin" -v e="$n_end" 'NR < s || NR > e' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    if [[ -n "$n_begin" || -n "$n_end" ]]; then
+      log_warn "Bloc géré incomplet dans $file (marqueur de début ou de fin manquant)."
+      echo "  Par sécurité, rien n'est supprimé : un nouveau bloc est ajouté à la suite." >&2
+      echo "  Vous pouvez retirer l'ancien à la main si nécessaire." >&2
+    fi
+    cat "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
   fi
-
   {
     printf '\n%s\n' "$begin"
     printf '%s\n' "$content"
     printf '%s\n' "$end"
-  } >> "$file"
+  } >> "$tmp" || { rm -f "$tmp"; return 1; }
+  installer_contenu "$file" "$tmp"
 }
 
 ################################################################################
@@ -959,16 +1005,38 @@ v_ssh_port() {
   return 0
 }
 
+# ports_depuis_listen
+# Lit sur l'entrée standard la sortie de « systemctl show ssh.socket
+# --property=Listen --value » et imprime un port par ligne. Chaque ligne vaut
+# « ADRESSE (Type) » ; l'adresse est « [::]:22 », « 0.0.0.0:22 », « 22 » (toutes
+# interfaces) ou le chemin d'une socket Unix (ignoré). Le port est ce qui suit
+# le dernier « : » de l'adresse, ou l'adresse entière si elle n'en a pas. Une
+# analyse explicite plutôt qu'un motif compact : « 2222 » ne vaut pas « 22 ».
+ports_depuis_listen() {
+  awk '
+    NF == 0 { next }
+    { a = $1 }
+    a ~ /^\// { next }
+    { sub(/^.*:/, "", a); if (a ~ /^[0-9]+$/) print a }
+  '
+}
+
+# ssh_socket_tient_port <port>
+# Vrai si ssh.socket est active et déclare ce port d'écoute.
+ssh_socket_tient_port() {
+  local port="${1:-}"
+  [[ -n "$port" ]] || return 1
+  systemctl is-active --quiet ssh.socket 2>/dev/null || return 1
+  systemctl show ssh.socket --property=Listen --value 2>/dev/null | ports_depuis_listen | grep -qx -- "$port"
+}
+
 # ssh_holds_port <port> <sortie de « ss -tlnp »>
 # Vrai si le processus en écoute est sshd lui-même, ou systemd pour le compte
 # de ssh.socket (activation par socket : c'est PID 1 qui tient le port).
 ssh_holds_port() {
   local port="${1:-}" listeners="${2:-}"
   grep -q 'users:(("sshd"' <<< "$listeners" && return 0
-  if grep -q 'users:(("systemd"' <<< "$listeners" && systemctl is-active --quiet ssh.socket 2>/dev/null &&
-     systemctl show ssh.socket --property=Listen --value 2>/dev/null | grep -qE "(^|[]:.])${port}( |$)"; then
-    return 0
-  fi
+  grep -q 'users:(("systemd"' <<< "$listeners" && ssh_socket_tient_port "$port" && return 0
   return 1
 }
 
@@ -1393,7 +1461,7 @@ ifupdown_file_mentions_iface() {
 ifupdown_strip_iface_stanzas() {
   local file="${1:-}" iface="${2:-}" tmp
   [[ -f "$file" && -n "$iface" ]] || return 1
-  tmp="$(mktemp)" || return 1
+  tmp="$(temporaire_pour "$file")" || return 1
   # Deux lectures du même fichier : la première cherche une strophe IPv4 de la
   # carte ; sans elle, RIEN n'est retiré, pas même « auto »/« allow-hotplug »,
   # sinon une configuration IPv6 seule cesserait de s'activer au démarrage.
@@ -1417,8 +1485,10 @@ ifupdown_strip_iface_stanzas() {
         }
         if (!skip) print
       }
-    ' "$file" "$file" > "$tmp" && cat "$tmp" > "$file"; then
-    rm -f "$tmp"
+    ' "$file" "$file" > "$tmp"; then
+    # Mise en place atomique, droits et propriétaire conservés : jamais de
+    # fichier tronqué, même interrompu ou disque plein.
+    installer_contenu "$file" "$tmp" || return 1
     return 0
   fi
   rm -f "$tmp"
@@ -1890,9 +1960,12 @@ journal() { logger -t ip-fixe "$*" 2>/dev/null; echo "$*"; }
 # lecture seule…), et un lien symbolique est remplacé, pas traversé.
 # Codes : 0 restauré, 2 sauvegarde absente, 1 copie en échec.
 restaurer_fichier() {
-  local orig="$1" sauvegarde="${2:-}" tmp="$1.restauration.$$"
+  local orig="$1" sauvegarde="${2:-}" tmp
   [ -n "$sauvegarde" ] || return 2
   [ -e "$sauvegarde" ] || [ -L "$sauvegarde" ] || return 2
+  # Temporaire imprévisible dans le MÊME répertoire (renommage atomique), nom
+  # préfixé d'un point : « source …/* » ne le lit pas entre-temps.
+  tmp="$(mktemp "$(dirname -- "$orig")/.$(basename -- "$orig").XXXXXX" 2>/dev/null)" || return 1
   if cp -a "$sauvegarde" "$tmp" 2>/dev/null && mv -f "$tmp" "$orig" 2>/dev/null; then
     return 0
   fi

@@ -189,6 +189,22 @@ BLOC
 egal "marqueurs inversés : contenu conservé"             "1" "$(grep -c '^A-CONSERVER$' "$TMP_RC")"
 rm -f "$TMP_RC"
 
+# Réécriture atomique : droits conservés, aucun temporaire laissé, et un lien
+# symbolique est suivi (le fichier visé est réécrit, le lien reste en place).
+TMP_RCD="$(mktemp -d)"
+printf 'ligne existante\n' > "$TMP_RCD/rc"
+chmod 640 "$TMP_RCD/rc"
+ln -s "$TMP_RCD/rc" "$TMP_RCD/lien"
+write_marked_block "$TMP_RCD/lien" "# >>> debut >>>" "# <<< fin <<<" <<'BLOC'
+via le lien
+BLOC
+egal "droits conservés"                      "640" "$(stat -c '%a' "$TMP_RCD/rc")"
+ok   "le lien symbolique est resté un lien"  test -L "$TMP_RCD/lien"
+egal "le fichier visé porte le bloc"         "1" "$(grep -c '^via le lien$' "$TMP_RCD/rc")"
+# shellcheck disable=SC2012
+egal "aucun temporaire laissé"               "lien rc" "$(ls -A "$TMP_RCD" | sort | tr '\n' ' ' | sed 's/ $//')"
+rm -rf "$TMP_RCD"
+
 echo "== set_sshd_directive =="
 TMP_SSHD="$(mktemp)"
 printf '#Port 22\nPermitRootLogin prohibit-password\n' > "$TMP_SSHD"
@@ -213,19 +229,24 @@ rm -f "$TMP_SSHD"
 echo "== restore_file / sshd_restore_or_remove =="
 # La copie passe par un fichier temporaire : un échec ne supprime jamais
 # l'original. Codes : 0 restauré, 2 sauvegarde absente, 1 copie en échec.
-TMP_RS="$(mktemp)"
+TMP_RSD="$(mktemp -d)"
+TMP_RS="$TMP_RSD/fichier"
 printf 'origine\n' > "$TMP_RS"
 cp "$TMP_RS" "$TMP_RS.bak.$RUN_STAMP"
+chmod 640 "$TMP_RS.bak.$RUN_STAMP"
 printf 'modifie\n' > "$TMP_RS"
+chmod 600 "$TMP_RS"
 ok   "restauration réussie"                 restore_file "$TMP_RS" "$TMP_RS.bak.$RUN_STAMP"
 egal "contenu d'origine rétabli"            "origine" "$(cat "$TMP_RS")"
+egal "droits de la sauvegarde reportés"     "640" "$(stat -c '%a' "$TMP_RS")"
+egal "aucun temporaire laissé (nom imprévisible, nettoyé)" "0" "$(find "$TMP_RSD" -name '.*' | wc -l)"
 egal "sauvegarde absente : code 2"          "2" "$(restore_file "$TMP_RS" "$TMP_RS-absent"; echo $?)"
 egal "sauvegarde absente : fichier intact"  "origine" "$(cat "$TMP_RS")"
 ok   "sshd_restore_or_remove restaure"      sshd_restore_or_remove "$TMP_RS"
 rm -f "$TMP_RS.bak.$RUN_STAMP"
 ok   "sans sauvegarde : fichier créé par nous, supprimé" sshd_restore_or_remove "$TMP_RS"
 ko   "le fichier n'existe plus"             test -e "$TMP_RS"
-rm -f "$TMP_RS" "$TMP_RS.bak.$RUN_STAMP"
+rm -rf "$TMP_RSD"
 
 echo "== sshd_snapshot_durcissement / sshd_restaurer_durcissement =="
 # La copie de l'exécution (.bak.RUN_STAMP) date d'avant l'étape 7 ; le
@@ -271,6 +292,32 @@ SORTIE_AUTRE='LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("nginx",pid=2,fd=6))'
 ok "port tenu par sshd : SSH le tient"       ssh_holds_port 22 "$SORTIE_SSHD"
 ko "port tenu par nginx : SSH ne le tient pas" ssh_holds_port 22 "$SORTIE_AUTRE"
 ko "aucun processus : SSH ne le tient pas"   ssh_holds_port 22 ""
+# Analyse de « Listen » de ssh.socket : un port par ligne, sans motif compact.
+egal "Listen « [::]:22 (Stream) » → 22"                 "22"      "$(printf '[::]:22 (Stream)\n' | ports_depuis_listen)"
+egal "Listen « 0.0.0.0:2222 (Stream) » → 2222"          "2222"    "$(printf '0.0.0.0:2222 (Stream)\n' | ports_depuis_listen)"
+egal "Listen « 22 (Stream) » (toutes interfaces) → 22"  "22"      "$(printf '22 (Stream)\n' | ports_depuis_listen)"
+egal "Listen : socket Unix ignorée"                     ""        "$(printf '/run/sshd.sock (Stream)\n' | ports_depuis_listen)"
+egal "Listen : plusieurs entrées"                       "22 2222" "$(printf '[::]:22 (Stream)\n0.0.0.0:2222 (Stream)\n' | ports_depuis_listen | tr '\n' ' ' | sed 's/ $//')"
+# Branche « activation par socket » : c'est systemd (PID 1) qui tient le port
+# pour ssh.socket. « systemctl » est doublé : socket active ou non, et sa liste
+# Listen.
+TMP_SC="$(mktemp -d)"
+# shellcheck disable=SC2016
+printf '#!/bin/bash\ncase "$1" in\n  is-active) [ -e "%s/socket-active" ] ;;\n  show) cat "%s/listen" ;;\n  *) exit 0 ;;\nesac\n' "$TMP_SC" "$TMP_SC" > "$TMP_SC/systemctl"
+chmod 755 "$TMP_SC/systemctl"
+SORTIE_SYSTEMD='LISTEN 0 4096 *:22 *:* users:(("systemd",pid=1,fd=40))'
+# shellcheck disable=SC2030,SC2031
+holds_avec_systemctl() { ( PATH="$TMP_SC:$PATH"; ssh_holds_port "$1" "$2" ); }
+printf '[::]:22 (Stream)\n0.0.0.0:22 (Stream)\n' > "$TMP_SC/listen"
+: > "$TMP_SC/socket-active"
+ok "socket active sur 22, port 22 : SSH le tient"                 holds_avec_systemctl 22 "$SORTIE_SYSTEMD"
+ko "socket active sur 22, port 2222 : SSH ne le tient pas"        holds_avec_systemctl 2222 "$SORTIE_SYSTEMD"
+printf '[::]:2222 (Stream)\n' > "$TMP_SC/listen"
+ko "socket sur 2222 : « 22 » n'est pas pris pour un suffixe"      holds_avec_systemctl 22 "$SORTIE_SYSTEMD"
+ok "socket sur 2222 : le 2222 est tenu"                           holds_avec_systemctl 2222 "$SORTIE_SYSTEMD"
+rm -f "$TMP_SC/socket-active"
+ko "socket inactive : systemd en écoute n'est pas SSH"            holds_avec_systemctl 2222 "$SORTIE_SYSTEMD"
+rm -rf "$TMP_SC"
 # « ss » est remplacé par une doublure qui rejoue une sortie choisie : le port
 # 22 doit subir le même contrôle que les autres ports. L'ancien code l'en
 # exemptait : un autre service tenant le 22 était accepté, le redémarrage de
@@ -402,7 +449,8 @@ echo "== ifupdown_file_mentions_iface / ifupdown_strip_iface_stanzas =="
 # ifupdown applique TOUTES les strophes « iface » d'un même nom : la strophe
 # « inet dhcp » de l'installateur doit disparaître quand on écrit la statique,
 # sans toucher à lo ni aux autres cartes.
-TMP_IF="$(mktemp)"
+TMP_IFD="$(mktemp -d)"
+TMP_IF="$TMP_IFD/interfaces"
 cat > "$TMP_IF" <<'EOF'
 source /etc/network/interfaces.d/*
 
@@ -426,7 +474,10 @@ ok "ens18 mentionnée"                    ifupdown_file_mentions_iface "$TMP_IF"
 ok "ens19 mentionnée"                    ifupdown_file_mentions_iface "$TMP_IF" ens19
 ko "ens20 absente"                       ifupdown_file_mentions_iface "$TMP_IF" ens20
 ko "« ens1 » n'est pas un préfixe de ens18" ifupdown_file_mentions_iface "$TMP_IF" ens1
+chmod 640 "$TMP_IF"
 ok   "strip renvoie 0"                   ifupdown_strip_iface_stanzas "$TMP_IF" ens18
+egal "droits conservés (réécriture atomique)" "640" "$(stat -c '%a' "$TMP_IF")"
+egal "aucun temporaire laissé dans le répertoire" "interfaces" "$(ls -A "$TMP_IFD")"
 egal "strophe iface ens18 inet retirée"  "0" "$(grep -c '^iface ens18 inet ' "$TMP_IF")"
 egal "options de la strophe retirées"    "0" "$(grep -c 'metric 100' "$TMP_IF")"
 egal "strophe inet6 de ens18 CONSERVÉE"  "1" "$(grep -c '^iface ens18 inet6 static' "$TMP_IF")"
@@ -438,7 +489,7 @@ egal "strophe ens19 intacte"             "1" "$(grep -c '^    address 10.0.0.2/2
 egal "ligne source conservée"            "1" "$(grep -c '^source ' "$TMP_IF")"
 ko "ens18 n'est plus mentionnée (inet6 seule ne compte pas)" ifupdown_file_mentions_iface "$TMP_IF" ens18
 ko "fichier inexistant refusé"           ifupdown_strip_iface_stanzas "$TMP_IF-absent" ens18
-rm -f "$TMP_IF"
+rm -rf "$TMP_IFD"
 
 # Configuration IPv6 seule : sans strophe « inet », RIEN n'est retiré, pas même
 # « allow-hotplug », sinon l'IPv6 cesserait de s'activer au démarrage.
